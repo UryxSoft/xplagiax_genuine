@@ -16,3 +16,6 @@ venv/
 # IDE
 .idea/
 .vscode/
+.venv/
+.pytest_cache/
+*.egg-info/
