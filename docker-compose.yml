@@ -1,0 +1,47 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://xplagiax:xplagiax@postgres:5432/xplagiax
+      PARSER_GROBID_BASE_URL: http://grobid:8070
+      TURBOVEC_INDEX_PATH: /data/turbovec/index.tvim
+    volumes:
+      - turbovec_data:/data/turbovec
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: xplagiax
+      POSTGRES_USER: xplagiax
+      POSTGRES_PASSWORD: xplagiax
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xplagiax"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Optional: RF-08/ADR-012 bibliographic metadata extraction. Large image
+  # (~5 GB) -- omit this service (and set PARSER_GROBID_ENABLED=false) if
+  # GROBID is not needed; GrobidAdapter degrades to null metadata rather
+  # than failing when unreachable (GrobidUnavailableError is caught by
+  # PdfParserService).
+  grobid:
+    image: lfoppiano/grobid:0.8.0
+    ports:
+      - "8070:8070"
+    profiles:
+      - with-grobid
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  turbovec_data:
