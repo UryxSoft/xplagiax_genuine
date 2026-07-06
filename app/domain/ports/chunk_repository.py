@@ -16,3 +16,11 @@ class ChunkRepository(Protocol):
 
     def by_document(self, document_id: str) -> list[Chunk]:
         ...
+
+    def ids_for_documents(self, document_ids: list[str]) -> list[int]:
+        """Returns chunk ids only, across possibly many documents, in one query.
+
+        Used by CandidateFilter to build TurboVec allowlists without an
+        N+1 fetch-full-Chunk-per-document pattern.
+        """
+        ...

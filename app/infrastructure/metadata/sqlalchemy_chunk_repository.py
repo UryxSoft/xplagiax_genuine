@@ -36,3 +36,9 @@ class SqlAlchemyChunkRepository:
         )
         models = self._session.execute(stmt).scalars().all()
         return [orm_to_chunk(m) for m in models]
+
+    def ids_for_documents(self, document_ids: list[str]) -> list[int]:
+        if not document_ids:
+            return []
+        stmt = select(ChunkModel.id).where(ChunkModel.document_id.in_(document_ids))
+        return list(self._session.execute(stmt).scalars().all())

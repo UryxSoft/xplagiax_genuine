@@ -49,6 +49,16 @@ class SqlAlchemyDocumentRepository:
         models = self._session.execute(stmt).scalars().all()
         return [orm_to_document(m) for m in models]
 
+    def ids_matching(
+        self, tenant_id: str, language: str | None = None, topic: str | None = None
+    ) -> list[str]:
+        stmt = select(DocumentModel.id).where(DocumentModel.tenant_id == tenant_id)
+        if language is not None:
+            stmt = stmt.where(DocumentModel.language_code == language)
+        if topic is not None:
+            stmt = stmt.where(DocumentModel.topic_domain == topic)
+        return list(self._session.execute(stmt).scalars().all())
+
     def delete(self, document_id: str) -> None:
         model = self._session.get(DocumentModel, document_id)
         if model is not None:

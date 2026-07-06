@@ -23,5 +23,17 @@ class DocumentRepository(Protocol):
     ) -> list[Document]:
         ...
 
+    def ids_matching(
+        self, tenant_id: str, language: str | None = None, topic: str | None = None
+    ) -> list[str]:
+        """Returns matching document ids only, unpaginated.
+
+        Used by CandidateFilter (ADR-004, filter-first search) to build an
+        allowlist over a tenant's full matching corpus: loading paginated
+        full Document aggregates (`list`, 20/page) for that purpose would
+        be prohibitively wasteful at the scale this system targets.
+        """
+        ...
+
     def delete(self, document_id: str) -> None:
         ...
