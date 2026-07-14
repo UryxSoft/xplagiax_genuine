@@ -1,0 +1,1927 @@
+From 38686f48ca174e2249843b2e4655995c0c8b38b4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 14 Jul 2026 14:26:24 +0000
+Subject: [PATCH 2/5] feat: plain-text indexing, country metadata, document
+ CRUD and stats endpoints
+
+Fase 1 of the plain-text manager plan:
+- POST /index: normalize plain text, tenant-scoped SHA256 dedup, hybrid
+  chunking, batch embeddings, TurboVec add + PostgreSQL metadata, with
+  deterministic 63-bit chunk ids (idempotent retries, no id coordination)
+- BibliographicMetadata gains country; ORM column bib_country; dynamic
+  case-insensitive filters (idioma, tema, institucion, pais) in
+  GET /documents
+- GET /documents/{id} (chunk count included), DELETE /documents/{id}
+  (tenant-scoped, vectors first then metadata), GET /stats (corpus counts,
+  index dimension/version)
+- plain-text normalizer separate from the PDF header/footer stripper
+- in-memory port fakes + end-to-end API tests; 184 tests green
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EYjnjSLC45cRbKiBbYcL7u
+---
+ .gitignore                                    |   1 -
+ app/api/app_factory.py                        |   4 +
+ app/api/dependencies.py                       |   6 +
+ app/api/routes/documents.py                   | 116 ++++++++
+ app/api/routes/index.py                       |  60 +++++
+ app/api/schemas.py                            |  54 ++++
+ app/application/indexing/__init__.py          |   0
+ app/application/indexing/chunk_id_factory.py  |  28 ++
+ app/application/indexing/document_deleter.py  |  46 ++++
+ app/application/indexing/indexing_pipeline.py | 162 +++++++++++
+ app/domain/ports/chunk_repository.py          |   6 +
+ app/domain/ports/document_repository.py       |  16 +-
+ .../value_objects/bibliographic_metadata.py   |   1 +
+ app/domain/value_objects/pdf_source.py        |  15 +-
+ app/infrastructure/metadata/mappers.py        |   2 +
+ app/infrastructure/metadata/orm.py            |   1 +
+ .../metadata/sqlalchemy_chunk_repository.py   |  17 +-
+ .../sqlalchemy_document_repository.py         |  20 +-
+ .../parsers/plain_text_normalizer.py          |  25 ++
+ tests/integration/inmemory.py                 | 225 ++++++++++++++++
+ tests/integration/test_index_documents_api.py | 255 ++++++++++++++++++
+ tests/integration/test_search_api.py          |  51 +++-
+ tests/unit/application/indexing/__init__.py   |   0
+ .../indexing/test_chunk_id_factory.py         |  28 ++
+ .../indexing/test_document_deleter.py         |  63 +++++
+ .../indexing/test_indexing_pipeline.py        | 137 ++++++++++
+ tests/unit/metadata/test_document_filters.py  | 128 +++++++++
+ .../parsers/test_plain_text_normalizer.py     |  24 ++
+ wsgi.py                                       |  16 ++
+ 29 files changed, 1488 insertions(+), 19 deletions(-)
+ create mode 100644 app/api/routes/documents.py
+ create mode 100644 app/api/routes/index.py
+ create mode 100644 app/application/indexing/__init__.py
+ create mode 100644 app/application/indexing/chunk_id_factory.py
+ create mode 100644 app/application/indexing/document_deleter.py
+ create mode 100644 app/application/indexing/indexing_pipeline.py
+ create mode 100644 app/infrastructure/parsers/plain_text_normalizer.py
+ create mode 100644 tests/integration/inmemory.py
+ create mode 100644 tests/integration/test_index_documents_api.py
+ create mode 100644 tests/unit/application/indexing/__init__.py
+ create mode 100644 tests/unit/application/indexing/test_chunk_id_factory.py
+ create mode 100644 tests/unit/application/indexing/test_document_deleter.py
+ create mode 100644 tests/unit/application/indexing/test_indexing_pipeline.py
+ create mode 100644 tests/unit/metadata/test_document_filters.py
+ create mode 100644 tests/unit/parsers/test_plain_text_normalizer.py
+
+diff --git a/.gitignore b/.gitignore
+index 7cbe53d..046facc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -16,6 +16,5 @@ venv/
+ # IDE
+ .idea/
+ .vscode/
+-.venv/
+ .pytest_cache/
+ *.egg-info/
+diff --git a/app/api/app_factory.py b/app/api/app_factory.py
+index 07f4349..51b2919 100644
+--- a/app/api/app_factory.py
++++ b/app/api/app_factory.py
+@@ -12,7 +12,9 @@ from flask import Flask
+ 
+ from app.api.dependencies import AppDependencies
+ from app.api.error_handlers import register_error_handlers
++from app.api.routes.documents import documents_bp
+ from app.api.routes.health import health_bp
++from app.api.routes.index import index_bp
+ from app.api.routes.search import search_bp
+ 
+ 
+@@ -22,6 +24,8 @@ def create_app(dependencies: AppDependencies) -> Flask:
+ 
+     app.register_blueprint(health_bp)
+     app.register_blueprint(search_bp)
++    app.register_blueprint(index_bp)
++    app.register_blueprint(documents_bp)
+     register_error_handlers(app)
+ 
+     return app
+diff --git a/app/api/dependencies.py b/app/api/dependencies.py
+index 2d3815d..9e6a3a0 100644
+--- a/app/api/dependencies.py
++++ b/app/api/dependencies.py
+@@ -11,6 +11,8 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ 
++from app.application.indexing.document_deleter import DocumentDeleter
++from app.application.indexing.indexing_pipeline import IndexingPipeline
+ from app.application.ranking.plagiarism_scorer import PlagiarismScorer
+ from app.application.ranking.reranker import Reranker
+ from app.application.search.search_pipeline import SearchPipeline
+@@ -18,6 +20,7 @@ from app.domain.ports.chunk_repository import ChunkRepository
+ from app.domain.ports.document_repository import DocumentRepository
+ from app.domain.ports.language_detector import LanguageDetector
+ from app.domain.ports.topic_classifier import TopicClassifier
++from app.domain.ports.vector_index_repository import VectorIndexRepository
+ 
+ 
+ @dataclass(frozen=True)
+@@ -29,3 +32,6 @@ class AppDependencies:
+     search_pipeline: SearchPipeline
+     reranker: Reranker
+     plagiarism_scorer: PlagiarismScorer
++    indexing_pipeline: IndexingPipeline
++    document_deleter: DocumentDeleter
++    vector_index: VectorIndexRepository
+diff --git a/app/api/routes/documents.py b/app/api/routes/documents.py
+new file mode 100644
+index 0000000..39c1966
+--- /dev/null
++++ b/app/api/routes/documents.py
+@@ -0,0 +1,116 @@
++"""Document catalog endpoints (RF-14/RF-15): list, detail, delete, stats.
++
++Every operation is tenant-scoped (ADR-011): tenant_id is a required query
++parameter, and cross-tenant ids answer 404, indistinguishable from
++nonexistent ones.
++"""
++
++from __future__ import annotations
++
++from flask import Blueprint, current_app, jsonify, request
++
++from app.api.dependencies import AppDependencies
++from app.api.schemas import (
++    DocumentListResponseSchema,
++    DocumentSummarySchema,
++    StatsResponseSchema,
++)
++from app.domain.entities.document import Document
++
++documents_bp = Blueprint("documents", __name__)
++
++
++def _summary(document: Document) -> DocumentSummarySchema:
++    return DocumentSummarySchema(
++        id=document.id,
++        documento=document.source.filename,
++        titulo=document.bibliography.title,
++        autores=list(document.bibliography.authors),
++        institucion=document.bibliography.institution,
++        pais=document.bibliography.country,
++        idioma=document.language.code if document.language else None,
++        tema=document.topic.domain if document.topic else None,
++        estado=document.status.value,
++        indexado_en=document.indexed_at.isoformat() if document.indexed_at else None,
++    )
++
++
++def _require_tenant() -> str | None:
++    tenant_id = request.args.get("tenant_id", "").strip()
++    return tenant_id or None
++
++
++@documents_bp.get("/documents")
++def list_documents():
++    deps: AppDependencies = current_app.config["DEPENDENCIES"]
++
++    tenant_id = _require_tenant()
++    if tenant_id is None:
++        return jsonify({"error": "invalid_request", "message": "tenant_id query parameter is required"}), 400
++
++    try:
++        page = int(request.args.get("page", "1"))
++    except ValueError:
++        return jsonify({"error": "invalid_request", "message": "page must be an integer"}), 400
++    if page < 1:
++        return jsonify({"error": "invalid_request", "message": "page must be >= 1"}), 400
++
++    documents = deps.document_repository.list(
++        tenant_id,
++        language=request.args.get("idioma"),
++        topic=request.args.get("tema"),
++        institution=request.args.get("institucion"),
++        country=request.args.get("pais"),
++        page=page,
++    )
++    response = DocumentListResponseSchema(documents=[_summary(d) for d in documents], page=page)
++    return jsonify(response.model_dump()), 200
++
++
++@documents_bp.get("/documents/<document_id>")
++def get_document(document_id: str):
++    deps: AppDependencies = current_app.config["DEPENDENCIES"]
++
++    tenant_id = _require_tenant()
++    if tenant_id is None:
++        return jsonify({"error": "invalid_request", "message": "tenant_id query parameter is required"}), 400
++
++    document = deps.document_repository.by_id(document_id)
++    if document is None or document.tenant_id != tenant_id:
++        return jsonify({"error": "not_found", "message": "document not found"}), 404
++
++    body = _summary(document).model_dump()
++    body["chunks"] = len(deps.chunk_repository.by_document(document_id))
++    return jsonify(body), 200
++
++
++@documents_bp.delete("/documents/<document_id>")
++def delete_document(document_id: str):
++    deps: AppDependencies = current_app.config["DEPENDENCIES"]
++
++    tenant_id = _require_tenant()
++    if tenant_id is None:
++        return jsonify({"error": "invalid_request", "message": "tenant_id query parameter is required"}), 400
++
++    deleted = deps.document_deleter.delete(document_id, tenant_id)
++    if not deleted:
++        return jsonify({"error": "not_found", "message": "document not found"}), 404
++    return jsonify({"deleted": True, "document_id": document_id}), 200
++
++
++@documents_bp.get("/stats")
++def stats():
++    deps: AppDependencies = current_app.config["DEPENDENCIES"]
++
++    tenant_id = _require_tenant()
++    if tenant_id is None:
++        return jsonify({"error": "invalid_request", "message": "tenant_id query parameter is required"}), 400
++
++    response = StatsResponseSchema(
++        tenant_id=tenant_id,
++        documents=deps.document_repository.count(tenant_id),
++        chunks=deps.chunk_repository.count_for_tenant(tenant_id),
++        index_dimension=deps.vector_index.dimension,
++        index_version=deps.vector_index.version,
++    )
++    return jsonify(response.model_dump()), 200
+diff --git a/app/api/routes/index.py b/app/api/routes/index.py
+new file mode 100644
+index 0000000..a9fe063
+--- /dev/null
++++ b/app/api/routes/index.py
+@@ -0,0 +1,60 @@
++"""POST /index (RF-01/RF-14 ingestion side): plain text in, document indexed.
++
++Synchronous in Fase 1; Fase 3 adds the async job_id/polling variant
++(RF-13) on the same schema.
++"""
++
++from __future__ import annotations
++
++from flask import Blueprint, current_app, jsonify, request
++from pydantic import ValidationError
++
++from app.api.dependencies import AppDependencies
++from app.api.schemas import IndexRequestSchema, IndexResponseSchema
++from app.application.indexing.indexing_pipeline import (
++    EmptyDocumentError,
++    IndexCommand,
++)
++from app.domain.value_objects.bibliographic_metadata import BibliographicMetadata
++
++index_bp = Blueprint("index", __name__)
++
++
++@index_bp.post("/index")
++def index_document():
++    deps: AppDependencies = current_app.config["DEPENDENCIES"]
++
++    raw_body = request.get_json(silent=True) or {}
++    try:
++        payload = IndexRequestSchema.model_validate(raw_body)
++    except ValidationError as exc:
++        return jsonify({"error": "invalid_request", "details": exc.errors()}), 400
++
++    command = IndexCommand(
++        text=payload.text,
++        tenant_id=payload.tenant_id,
++        filename=payload.filename,
++        language_code=payload.idioma,
++        topic_domain=payload.tema,
++        bibliography=BibliographicMetadata(
++            title=payload.titulo,
++            authors=tuple(payload.autores),
++            institution=payload.institucion,
++            country=payload.pais,
++            year=payload.anio,
++        ),
++    )
++
++    try:
++        result = deps.indexing_pipeline.index(command)
++    except EmptyDocumentError as exc:
++        return jsonify({"error": "empty_document", "message": str(exc)}), 400
++
++    response = IndexResponseSchema(
++        document_id=result.document_id,
++        chunks_indexed=result.chunks_indexed,
++        duplicate=result.duplicate,
++        idioma=result.language_code,
++        tema=result.topic_domain,
++    )
++    return jsonify(response.model_dump()), 200 if result.duplicate else 201
+diff --git a/app/api/schemas.py b/app/api/schemas.py
+index 951a00b..c203bb7 100644
+--- a/app/api/schemas.py
++++ b/app/api/schemas.py
+@@ -39,3 +39,57 @@ class SearchResponseSchema(BaseModel):
+     query_topic: str
+     global_plagiarism_percent: float
+     documents: list[DocumentMatchSchema]
++
++
++class IndexRequestSchema(BaseModel):
++    """POST /index payload: full plain text plus optional catalog metadata.
++
++    idioma/tema, when provided, override automatic detection/classification
++    (the caller knows better than a heuristic); omitted fields fall back to
++    langdetect / centroid classification inside the pipeline.
++    """
++
++    text: str = Field(min_length=1)
++    tenant_id: str = Field(min_length=1)
++    filename: str | None = None
++    idioma: str | None = Field(default=None, min_length=2, max_length=2)
++    tema: str | None = None
++    titulo: str | None = None
++    autores: list[str] = Field(default_factory=list)
++    institucion: str | None = None
++    pais: str | None = None
++    anio: int | None = None
++
++
++class IndexResponseSchema(BaseModel):
++    document_id: str
++    chunks_indexed: int
++    duplicate: bool
++    idioma: str
++    tema: str
++
++
++class DocumentSummarySchema(BaseModel):
++    id: str
++    documento: str
++    titulo: str | None
++    autores: list[str]
++    institucion: str | None
++    pais: str | None
++    idioma: str | None
++    tema: str | None
++    estado: str
++    indexado_en: str | None
++
++
++class DocumentListResponseSchema(BaseModel):
++    documents: list[DocumentSummarySchema]
++    page: int
++
++
++class StatsResponseSchema(BaseModel):
++    tenant_id: str
++    documents: int
++    chunks: int
++    index_dimension: int
++    index_version: int
+diff --git a/app/application/indexing/__init__.py b/app/application/indexing/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/app/application/indexing/chunk_id_factory.py b/app/application/indexing/chunk_id_factory.py
+new file mode 100644
+index 0000000..28b8014
+--- /dev/null
++++ b/app/application/indexing/chunk_id_factory.py
+@@ -0,0 +1,28 @@
++"""Deterministic ChunkId derivation (shared uint64 key, docs/DOMAIN_MODEL.md sect 7).
++
++ChunkId = blake2b(document_id ++ order) truncated to 63 bits. Deterministic
++ids make indexing idempotent (a retried document maps onto the same TurboVec
++ids instead of duplicating vectors) and need no coordination service or DB
++sequence -- essential once multiple indexer processes exist (Fase 3).
++
++63 bits, not 64: the metadata store keeps ChunkId in a signed BigInteger
++(orm.py), so the sign bit must stay clear. Collision odds at the 10M-chunk
++scale the ADR targets are ~5e-6 (birthday bound over 2^63); the chunks
++primary key would surface a collision as an integrity error rather than
++silently corrupting the index.
++"""
++
++from __future__ import annotations
++
++import hashlib
++
++_MASK_63_BITS = (1 << 63) - 1
++
++
++def chunk_id_for(document_id: str, order: int) -> int:
++    if order < 0:
++        raise ValueError("order must be >= 0")
++    digest = hashlib.blake2b(
++        f"{document_id}\x00{order}".encode("utf-8"), digest_size=8
++    ).digest()
++    return int.from_bytes(digest, byteorder="big") & _MASK_63_BITS
+diff --git a/app/application/indexing/document_deleter.py b/app/application/indexing/document_deleter.py
+new file mode 100644
+index 0000000..0e4818f
+--- /dev/null
++++ b/app/application/indexing/document_deleter.py
+@@ -0,0 +1,46 @@
++"""Delete use case (RF-14): removes a document's vectors and metadata.
++
++Tenant-scoped: a document belonging to another tenant is reported as
++not-found, never as forbidden -- revealing existence across tenants is
++itself a leak (ADR-011).
++
++Delete ordering mirrors the indexing pipeline's rationale inverted:
++vectors go first so a failure midway leaves metadata pointing at missing
++vectors (search returns nothing for them) rather than live vectors with no
++metadata owner to delete them through.
++"""
++
++from __future__ import annotations
++
++from app.domain.ports.chunk_repository import ChunkRepository
++from app.domain.ports.document_repository import DocumentRepository
++from app.domain.ports.vector_index_repository import VectorIndexRepository
++
++
++class DocumentDeleter:
++    def __init__(
++        self,
++        document_repository: DocumentRepository,
++        chunk_repository: ChunkRepository,
++        vector_index: VectorIndexRepository,
++        snapshot_after_write: bool = True,
++    ) -> None:
++        self._documents = document_repository
++        self._chunks = chunk_repository
++        self._vector_index = vector_index
++        self._snapshot_after_write = snapshot_after_write
++
++    def delete(self, document_id: str, tenant_id: str) -> bool:
++        document = self._documents.by_id(document_id)
++        if document is None or document.tenant_id != tenant_id:
++            return False
++
++        for chunk_id in self._chunks.ids_for_documents([document_id]):
++            self._vector_index.remove(chunk_id)
++
++        self._chunks.delete_by_document(document_id)
++        self._documents.delete(document_id)
++
++        if self._snapshot_after_write:
++            self._vector_index.snapshot()
++        return True
+diff --git a/app/application/indexing/indexing_pipeline.py b/app/application/indexing/indexing_pipeline.py
+new file mode 100644
+index 0000000..8893ff0
+--- /dev/null
++++ b/app/application/indexing/indexing_pipeline.py
+@@ -0,0 +1,162 @@
++"""Plain-text indexing use case (RF-01/RF-11 ingestion side, ADR sect 10).
++
++Write ordering: vectors first, metadata second. If the vector add succeeds
++and the metadata write fails, the orphan vectors are harmless -- search
++skips hits whose chunk_id has no metadata row (ResultAggregator's defensive
++skip) and background compaction reclaims them. The opposite order would
++strand a metadata row whose content_hash blocks any retry (dedup would
++report "duplicate" for a document that never reached the index).
++
++Dedup scope: exact SHA256 within tenant. The ADR's full cascade
++(Bloom/SimHash/MinHash near-dup) needs an LSH store over the corpus;
++until that exists this pipeline does not pretend to near-dedup.
++"""
++
++from __future__ import annotations
++
++import uuid
++from dataclasses import dataclass
++from datetime import datetime, timezone
++
++from app.application.indexing.chunk_id_factory import chunk_id_for
++from app.domain.entities.chunk import Chunk
++from app.domain.entities.document import Document
++from app.domain.entities.document_status import DocumentStatus
++from app.domain.ports.chunk_repository import ChunkRepository
++from app.domain.ports.document_repository import DocumentRepository
++from app.domain.ports.embedding_model import EmbeddingModel
++from app.domain.ports.language_detector import LanguageDetector
++from app.domain.ports.topic_classifier import TopicClassifier
++from app.domain.ports.vector_index_repository import VectorIndexRepository
++from app.domain.value_objects.bibliographic_metadata import BibliographicMetadata
++from app.domain.value_objects.language import Language
++from app.domain.value_objects.pdf_source import PLAIN_TEXT_PATH, PdfSource
++from app.domain.value_objects.sha256_hash import Sha256Hash
++from app.domain.value_objects.topic import Topic
++from app.infrastructure.chunking.hybrid_chunker import HybridChunker
++from app.infrastructure.parsers.plain_text_normalizer import normalize_plain_text
++
++PROVIDED_METADATA_CONFIDENCE = 1.0
++
++
++class EmptyDocumentError(ValueError):
++    """Raised when the submitted text contains nothing indexable."""
++
++
++@dataclass(frozen=True)
++class IndexCommand:
++    text: str
++    tenant_id: str
++    filename: str | None = None
++    language_code: str | None = None
++    topic_domain: str | None = None
++    bibliography: BibliographicMetadata = BibliographicMetadata()
++
++
++@dataclass(frozen=True)
++class IndexResult:
++    document_id: str
++    chunks_indexed: int
++    duplicate: bool
++    language_code: str
++    topic_domain: str
++
++
++class IndexingPipeline:
++    def __init__(
++        self,
++        chunker: HybridChunker,
++        embedding_model: EmbeddingModel,
++        language_detector: LanguageDetector,
++        topic_classifier: TopicClassifier,
++        vector_index: VectorIndexRepository,
++        document_repository: DocumentRepository,
++        chunk_repository: ChunkRepository,
++        snapshot_after_write: bool = True,
++    ) -> None:
++        self._chunker = chunker
++        self._embedding_model = embedding_model
++        self._language_detector = language_detector
++        self._topic_classifier = topic_classifier
++        self._vector_index = vector_index
++        self._documents = document_repository
++        self._chunks = chunk_repository
++        self._snapshot_after_write = snapshot_after_write
++
++    def index(self, command: IndexCommand) -> IndexResult:
++        normalized = normalize_plain_text(command.text)
++        if not normalized:
++            raise EmptyDocumentError("document text is empty after normalization")
++
++        content_hash = Sha256Hash.of(normalized)
++        existing = self._documents.by_hash(command.tenant_id, content_hash)
++        if existing is not None:
++            return IndexResult(
++                document_id=existing.id,
++                chunks_indexed=0,
++                duplicate=True,
++                language_code=existing.language.code if existing.language else "",
++                topic_domain=existing.topic.domain if existing.topic else "",
++            )
++
++        language = (
++            Language(code=command.language_code, confidence=PROVIDED_METADATA_CONFIDENCE)
++            if command.language_code is not None
++            else self._language_detector.detect(normalized)
++        )
++        topic = (
++            Topic(domain=command.topic_domain, confidence=PROVIDED_METADATA_CONFIDENCE)
++            if command.topic_domain is not None
++            else self._topic_classifier.classify(normalized)
++        )
++
++        segments = self._chunker.chunk(normalized)
++        if not segments:
++            raise EmptyDocumentError("document text produced no indexable segments")
++
++        document_id = str(uuid.uuid4())
++        chunks = [
++            Chunk(
++                id=chunk_id_for(document_id, segment.order),
++                document_id=document_id,
++                text=segment.text,
++                span=segment.span,
++                order=segment.order,
++            )
++            for segment in segments
++        ]
++
++        vectors = self._embedding_model.embed_passages([c.text for c in chunks])
++        self._vector_index.add([c.id for c in chunks], vectors)
++
++        self._chunks.save_all(chunks)
++        self._documents.save(
++            Document(
++                id=document_id,
++                tenant_id=command.tenant_id,
++                source=PdfSource(
++                    filename=command.filename or f"{document_id}.txt",
++                    path=PLAIN_TEXT_PATH,
++                    pages=0,
++                    mime="text/plain",
++                    size_bytes=len(normalized.encode("utf-8")),
++                ),
++                content_hash=content_hash,
++                bibliography=command.bibliography,
++                language=language,
++                topic=topic,
++                status=DocumentStatus.INDEXED,
++                indexed_at=datetime.now(timezone.utc),
++            )
++        )
++
++        if self._snapshot_after_write:
++            self._vector_index.snapshot()
++
++        return IndexResult(
++            document_id=document_id,
++            chunks_indexed=len(chunks),
++            duplicate=False,
++            language_code=language.code,
++            topic_domain=topic.domain,
++        )
+diff --git a/app/domain/ports/chunk_repository.py b/app/domain/ports/chunk_repository.py
+index c200b86..6dde531 100644
+--- a/app/domain/ports/chunk_repository.py
++++ b/app/domain/ports/chunk_repository.py
+@@ -24,3 +24,9 @@ class ChunkRepository(Protocol):
+         N+1 fetch-full-Chunk-per-document pattern.
+         """
+         ...
++
++    def delete_by_document(self, document_id: str) -> None:
++        ...
++
++    def count_for_tenant(self, tenant_id: str) -> int:
++        ...
+diff --git a/app/domain/ports/document_repository.py b/app/domain/ports/document_repository.py
+index 5a1c813..fd41730 100644
+--- a/app/domain/ports/document_repository.py
++++ b/app/domain/ports/document_repository.py
+@@ -19,8 +19,22 @@ class DocumentRepository(Protocol):
+         ...
+ 
+     def list(
+-        self, tenant_id: str, language: str | None = None, topic: str | None = None, page: int = 1
++        self,
++        tenant_id: str,
++        language: str | None = None,
++        topic: str | None = None,
++        institution: str | None = None,
++        country: str | None = None,
++        page: int = 1,
+     ) -> list[Document]:
++        """Paginated listing with dynamic, freely combinable filters (RF-14).
++
++        institution and country match case-insensitively: catalog values come
++        from heterogeneous user-supplied metadata, not a controlled vocabulary.
++        """
++        ...
++
++    def count(self, tenant_id: str) -> int:
+         ...
+ 
+     def ids_matching(
+diff --git a/app/domain/value_objects/bibliographic_metadata.py b/app/domain/value_objects/bibliographic_metadata.py
+index 81d43c8..9626c29 100644
+--- a/app/domain/value_objects/bibliographic_metadata.py
++++ b/app/domain/value_objects/bibliographic_metadata.py
+@@ -17,6 +17,7 @@ class BibliographicMetadata(BaseModel):
+     title: str | None = None
+     authors: tuple[str, ...] = ()
+     institution: str | None = None
++    country: str | None = None
+     faculty: str | None = None
+     career: str | None = None
+     year: int | None = None
+diff --git a/app/domain/value_objects/pdf_source.py b/app/domain/value_objects/pdf_source.py
+index f59eb39..e5012e0 100644
+--- a/app/domain/value_objects/pdf_source.py
++++ b/app/domain/value_objects/pdf_source.py
+@@ -4,16 +4,21 @@ from __future__ import annotations
+ 
+ from pydantic import BaseModel, Field, field_validator
+ 
+-ALLOWED_MIME_TYPES = frozenset({"application/pdf"})
++ALLOWED_MIME_TYPES = frozenset({"application/pdf", "text/plain"})
+ MAX_PDF_SIZE_BYTES = 200 * 1024 * 1024  # 200 MB
+ 
++PLAIN_TEXT_PATH = "inline://text"
++
+ 
+ class PdfSource(BaseModel):
+-    """Immutable descriptor of an ingested PDF file.
++    """Immutable descriptor of an ingested source (PDF file or inline plain text).
++
++    Plain-text ingestion (POST /index) has no backing file: path is the
++    PLAIN_TEXT_PATH sentinel and pages is 0.
+ 
+-    Invariant: mime must be application/pdf and size must not exceed
+-    MAX_PDF_SIZE_BYTES (NFR-10, path traversal / MIME guard is enforced
+-    by the caller before constructing this value object).
++    Invariant: mime must be an ALLOWED_MIME_TYPES member and size must not
++    exceed MAX_PDF_SIZE_BYTES (NFR-10, path traversal / MIME guard is
++    enforced by the caller before constructing this value object).
+     """
+ 
+     model_config = {"frozen": True}
+diff --git a/app/infrastructure/metadata/mappers.py b/app/infrastructure/metadata/mappers.py
+index 1aa9602..f6cb8a6 100644
+--- a/app/infrastructure/metadata/mappers.py
++++ b/app/infrastructure/metadata/mappers.py
+@@ -27,6 +27,7 @@ def document_to_orm(document: Document) -> DocumentModel:
+         bib_title=document.bibliography.title,
+         bib_authors=list(document.bibliography.authors),
+         bib_institution=document.bibliography.institution,
++        bib_country=document.bibliography.country,
+         bib_faculty=document.bibliography.faculty,
+         bib_career=document.bibliography.career,
+         bib_year=document.bibliography.year,
+@@ -66,6 +67,7 @@ def orm_to_document(model: DocumentModel) -> Document:
+             title=model.bib_title,
+             authors=tuple(model.bib_authors or ()),
+             institution=model.bib_institution,
++            country=model.bib_country,
+             faculty=model.bib_faculty,
+             career=model.bib_career,
+             year=model.bib_year,
+diff --git a/app/infrastructure/metadata/orm.py b/app/infrastructure/metadata/orm.py
+index 52f456a..769446f 100644
+--- a/app/infrastructure/metadata/orm.py
++++ b/app/infrastructure/metadata/orm.py
+@@ -37,6 +37,7 @@ class DocumentModel(Base):
+     bib_title: Mapped[str | None]
+     bib_authors: Mapped[list] = mapped_column(JSON, default=list)
+     bib_institution: Mapped[str | None]
++    bib_country: Mapped[str | None]
+     bib_faculty: Mapped[str | None]
+     bib_career: Mapped[str | None]
+     bib_year: Mapped[int | None]
+diff --git a/app/infrastructure/metadata/sqlalchemy_chunk_repository.py b/app/infrastructure/metadata/sqlalchemy_chunk_repository.py
+index 9d0bfeb..3adb159 100644
+--- a/app/infrastructure/metadata/sqlalchemy_chunk_repository.py
++++ b/app/infrastructure/metadata/sqlalchemy_chunk_repository.py
+@@ -2,12 +2,12 @@
+ 
+ from __future__ import annotations
+ 
+-from sqlalchemy import select
++from sqlalchemy import delete, func, select
+ from sqlalchemy.orm import Session
+ 
+ from app.domain.entities.chunk import Chunk
+ from app.infrastructure.metadata.mappers import chunk_to_orm, orm_to_chunk
+-from app.infrastructure.metadata.orm import ChunkModel
++from app.infrastructure.metadata.orm import ChunkModel, DocumentModel
+ 
+ 
+ class SqlAlchemyChunkRepository:
+@@ -42,3 +42,16 @@ class SqlAlchemyChunkRepository:
+             return []
+         stmt = select(ChunkModel.id).where(ChunkModel.document_id.in_(document_ids))
+         return list(self._session.execute(stmt).scalars().all())
++
++    def delete_by_document(self, document_id: str) -> None:
++        self._session.execute(delete(ChunkModel).where(ChunkModel.document_id == document_id))
++        self._session.commit()
++
++    def count_for_tenant(self, tenant_id: str) -> int:
++        stmt = (
++            select(func.count())
++            .select_from(ChunkModel)
++            .join(DocumentModel, ChunkModel.document_id == DocumentModel.id)
++            .where(DocumentModel.tenant_id == tenant_id)
++        )
++        return int(self._session.execute(stmt).scalar_one())
+diff --git a/app/infrastructure/metadata/sqlalchemy_document_repository.py b/app/infrastructure/metadata/sqlalchemy_document_repository.py
+index f454387..d8c85da 100644
+--- a/app/infrastructure/metadata/sqlalchemy_document_repository.py
++++ b/app/infrastructure/metadata/sqlalchemy_document_repository.py
+@@ -2,7 +2,7 @@
+ 
+ from __future__ import annotations
+ 
+-from sqlalchemy import select
++from sqlalchemy import func, select
+ from sqlalchemy.orm import Session
+ 
+ from app.domain.entities.document import Document
+@@ -34,7 +34,13 @@ class SqlAlchemyDocumentRepository:
+         return orm_to_document(model) if model is not None else None
+ 
+     def list(
+-        self, tenant_id: str, language: str | None = None, topic: str | None = None, page: int = 1
++        self,
++        tenant_id: str,
++        language: str | None = None,
++        topic: str | None = None,
++        institution: str | None = None,
++        country: str | None = None,
++        page: int = 1,
+     ) -> list[Document]:
+         if page < 1:
+             raise ValueError("page must be >= 1")
+@@ -44,11 +50,21 @@ class SqlAlchemyDocumentRepository:
+             stmt = stmt.where(DocumentModel.language_code == language)
+         if topic is not None:
+             stmt = stmt.where(DocumentModel.topic_domain == topic)
++        if institution is not None:
++            stmt = stmt.where(func.lower(DocumentModel.bib_institution) == institution.lower())
++        if country is not None:
++            stmt = stmt.where(func.lower(DocumentModel.bib_country) == country.lower())
+ 
+         stmt = stmt.order_by(DocumentModel.id).offset((page - 1) * _PAGE_SIZE).limit(_PAGE_SIZE)
+         models = self._session.execute(stmt).scalars().all()
+         return [orm_to_document(m) for m in models]
+ 
++    def count(self, tenant_id: str) -> int:
++        stmt = select(func.count()).select_from(DocumentModel).where(
++            DocumentModel.tenant_id == tenant_id
++        )
++        return int(self._session.execute(stmt).scalar_one())
++
+     def ids_matching(
+         self, tenant_id: str, language: str | None = None, topic: str | None = None
+     ) -> list[str]:
+diff --git a/app/infrastructure/parsers/plain_text_normalizer.py b/app/infrastructure/parsers/plain_text_normalizer.py
+new file mode 100644
+index 0000000..7024b43
+--- /dev/null
++++ b/app/infrastructure/parsers/plain_text_normalizer.py
+@@ -0,0 +1,25 @@
++"""Whitespace normalization for inline plain-text ingestion (POST /index).
++
++Deliberately NOT TextNormalizer (text_normalizer.py): that one strips lines
++repeated across PDF pages (running headers/footers), a heuristic that is
++meaningless -- and destructive -- for single-blob plain text, where a
++legitimately repeated line would be deleted as a "header".
++
++Paragraph boundaries (blank lines) are preserved because HybridChunker's
++first-level split is the double newline (RF-05); collapsing them here would
++silently disable paragraph-respecting segmentation.
++"""
++
++from __future__ import annotations
++
++import re
++
++_TRAILING_SPACES = re.compile(r"[ \t]+\n")
++_MULTI_BLANK_LINES = re.compile(r"\n{3,}")
++
++
++def normalize_plain_text(text: str) -> str:
++    text = text.replace("\r\n", "\n").replace("\r", "\n")
++    text = _TRAILING_SPACES.sub("\n", text)
++    text = _MULTI_BLANK_LINES.sub("\n\n", text)
++    return text.strip()
+diff --git a/tests/integration/inmemory.py b/tests/integration/inmemory.py
+new file mode 100644
+index 0000000..4335208
+--- /dev/null
++++ b/tests/integration/inmemory.py
+@@ -0,0 +1,225 @@
++"""Complete in-memory fakes implementing the domain ports.
++
++Shared by the API integration tests: they exercise the real application
++services (IndexingPipeline, DocumentDeleter, SearchPipeline) over these
++fakes, proving the full request->pipeline->storage loop without
++PostgreSQL, TurboVec or a downloaded embedding model.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import math
++
++from app.domain.entities.chunk import Chunk
++from app.domain.entities.document import Document
++from app.domain.value_objects.embedding_vector import EmbeddingVector
++from app.domain.value_objects.language import Language
++from app.domain.value_objects.search_hit import SearchHit
++from app.domain.value_objects.sha256_hash import Sha256Hash
++from app.domain.value_objects.topic import Topic
++
++
++class InMemoryDocumentRepository:
++    def __init__(self, documents: list[Document] | None = None) -> None:
++        self._by_id: dict[str, Document] = {d.id: d for d in (documents or [])}
++
++    def save(self, document: Document) -> None:
++        self._by_id[document.id] = document
++
++    def by_id(self, document_id: str) -> Document | None:
++        return self._by_id.get(document_id)
++
++    def by_hash(self, tenant_id: str, content_hash: Sha256Hash) -> Document | None:
++        for document in self._by_id.values():
++            if document.tenant_id == tenant_id and document.content_hash == content_hash:
++                return document
++        return None
++
++    def list(
++        self,
++        tenant_id: str,
++        language: str | None = None,
++        topic: str | None = None,
++        institution: str | None = None,
++        country: str | None = None,
++        page: int = 1,
++    ) -> list[Document]:
++        def matches(d: Document) -> bool:
++            if d.tenant_id != tenant_id:
++                return False
++            if language is not None and (d.language is None or d.language.code != language):
++                return False
++            if topic is not None and (d.topic is None or d.topic.domain != topic):
++                return False
++            if institution is not None and (
++                d.bibliography.institution is None
++                or d.bibliography.institution.lower() != institution.lower()
++            ):
++                return False
++            if country is not None and (
++                d.bibliography.country is None
++                or d.bibliography.country.lower() != country.lower()
++            ):
++                return False
++            return True
++
++        matching = sorted((d for d in self._by_id.values() if matches(d)), key=lambda d: d.id)
++        page_size = 20
++        return matching[(page - 1) * page_size : page * page_size]
++
++    def ids_matching(
++        self, tenant_id: str, language: str | None = None, topic: str | None = None
++    ) -> list[str]:
++        return [d.id for d in self.list(tenant_id, language=language, topic=topic, page=1)]
++
++    def count(self, tenant_id: str) -> int:
++        return sum(1 for d in self._by_id.values() if d.tenant_id == tenant_id)
++
++    def delete(self, document_id: str) -> None:
++        self._by_id.pop(document_id, None)
++
++
++class InMemoryChunkRepository:
++    def __init__(self, chunks: list[Chunk] | None = None) -> None:
++        self._by_id: dict[int, Chunk] = {c.id: c for c in (chunks or [])}
++        self._documents: InMemoryDocumentRepository | None = None
++
++    def bind_documents(self, documents: InMemoryDocumentRepository) -> None:
++        # count_for_tenant needs the document->tenant relation the SQL
++        # implementation resolves with a join.
++        self._documents = documents
++
++    def save_all(self, chunks: list[Chunk]) -> None:
++        for chunk in chunks:
++            self._by_id[chunk.id] = chunk
++
++    def by_ids(self, chunk_ids: list[int]) -> list[Chunk]:
++        return [self._by_id[i] for i in chunk_ids if i in self._by_id]
++
++    def by_document(self, document_id: str) -> list[Chunk]:
++        return sorted(
++            (c for c in self._by_id.values() if c.document_id == document_id),
++            key=lambda c: c.order,
++        )
++
++    def ids_for_documents(self, document_ids: list[str]) -> list[int]:
++        wanted = set(document_ids)
++        return [c.id for c in self._by_id.values() if c.document_id in wanted]
++
++    def delete_by_document(self, document_id: str) -> None:
++        self._by_id = {i: c for i, c in self._by_id.items() if c.document_id != document_id}
++
++    def count_for_tenant(self, tenant_id: str) -> int:
++        if self._documents is None:
++            return 0
++        tenant_docs = {
++            d.id for d in self._documents._by_id.values() if d.tenant_id == tenant_id
++        }
++        return sum(1 for c in self._by_id.values() if c.document_id in tenant_docs)
++
++
++class InMemoryVectorIndex:
++    """Brute-force cosine search over stored vectors, allowlist-aware."""
++
++    def __init__(self, dimension: int = 8) -> None:
++        self._dimension = dimension
++        self._vectors: dict[int, EmbeddingVector] = {}
++        self._version = 0
++
++    @property
++    def dimension(self) -> int:
++        return self._dimension
++
++    @property
++    def version(self) -> int:
++        return self._version
++
++    def add(self, chunk_ids: list[int], vectors: list[EmbeddingVector]) -> None:
++        for chunk_id, vector in zip(chunk_ids, vectors):
++            self._vectors[chunk_id] = vector
++
++    def search(
++        self, query: EmbeddingVector, k: int, allowlist: set[int] | None = None
++    ) -> list[SearchHit]:
++        candidates = (
++            self._vectors.items()
++            if allowlist is None
++            else ((i, v) for i, v in self._vectors.items() if i in allowlist)
++        )
++        scored = [
++            SearchHit(chunk_id=chunk_id, score=_cosine(query.values, vector.values))
++            for chunk_id, vector in candidates
++        ]
++        scored.sort(key=lambda h: h.score, reverse=True)
++        return scored[:k]
++
++    def remove(self, chunk_id: int) -> None:
++        self._vectors.pop(chunk_id, None)
++
++    def snapshot(self) -> None:
++        self._version += 1
++
++    def __len__(self) -> int:
++        return len(self._vectors)
++
++
++def _cosine(a: tuple[float, ...], b: tuple[float, ...]) -> float:
++    dot = sum(x * y for x, y in zip(a, b))
++    norm_a = math.sqrt(sum(x * x for x in a))
++    norm_b = math.sqrt(sum(x * x for x in b))
++    if norm_a == 0.0 or norm_b == 0.0:
++        return 0.0
++    # identical vectors can give 1.0000000000000002 in floating point;
++    # downstream signals require [0, 1]
++    return max(0.0, min(1.0, dot / (norm_a * norm_b)))
++
++
++class HashingEmbeddingModel:
++    """Deterministic, content-sensitive fake embeddings.
++
++    Word-level hashing into a small dense vector: identical texts map to
++    identical vectors and overlapping texts to similar ones, which is
++    enough signal for end-to-end index->search assertions.
++    """
++
++    def __init__(self, dimension: int = 8) -> None:
++        self._dimension = dimension
++
++    @property
++    def dimension(self) -> int:
++        return self._dimension
++
++    @property
++    def name(self) -> str:
++        return "hashing-fake"
++
++    def embed_passages(self, texts: list[str]) -> list[EmbeddingVector]:
++        return [self._embed(t) for t in texts]
++
++    def embed_query(self, text: str) -> EmbeddingVector:
++        return self._embed(text)
++
++    def _embed(self, text: str) -> EmbeddingVector:
++        buckets = [0.0] * self._dimension
++        for word in text.lower().split():
++            digest = hashlib.md5(word.encode("utf-8")).digest()
++            buckets[digest[0] % self._dimension] += 1.0
++        norm = math.sqrt(sum(x * x for x in buckets)) or 1.0
++        return EmbeddingVector(values=tuple(x / norm for x in buckets))
++
++
++class StaticLanguageDetector:
++    def __init__(self, code: str = "es", confidence: float = 0.95) -> None:
++        self._language = Language(code=code, confidence=confidence)
++
++    def detect(self, text: str) -> Language:
++        return self._language
++
++
++class StaticTopicClassifier:
++    def __init__(self, domain: str = "Ingenieria", confidence: float = 0.9) -> None:
++        self._topic = Topic(domain=domain, confidence=confidence)
++
++    def classify(self, text: str) -> Topic:
++        return self._topic
+diff --git a/tests/integration/test_index_documents_api.py b/tests/integration/test_index_documents_api.py
+new file mode 100644
+index 0000000..e183219
+--- /dev/null
++++ b/tests/integration/test_index_documents_api.py
+@@ -0,0 +1,255 @@
++"""End-to-end API tests for the Fase 1 CRUD surface: POST /index,
++GET /documents (dynamic filters), GET/DELETE /documents/{id}, GET /stats.
++
++Real application services (IndexingPipeline, DocumentDeleter,
++SearchPipeline) run over complete in-memory fakes (tests/integration/
++inmemory.py), so these tests prove the whole loop: index -> catalog ->
++search -> delete -> gone.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from app.api.app_factory import create_app
++from app.api.dependencies import AppDependencies
++from app.application.indexing.document_deleter import DocumentDeleter
++from app.application.indexing.indexing_pipeline import IndexingPipeline
++from app.application.ranking.plagiarism_scorer import PlagiarismScorer
++from app.application.ranking.reranker import Reranker
++from app.application.search.candidate_filter import CandidateFilter
++from app.application.search.result_aggregator import ResultAggregator
++from app.application.search.search_pipeline import SearchPipeline
++from app.infrastructure.chunking.hybrid_chunker import HybridChunker
++from app.infrastructure.chunking.word_token_counter import WordTokenCounter
++from tests.integration.inmemory import (
++    HashingEmbeddingModel,
++    InMemoryChunkRepository,
++    InMemoryDocumentRepository,
++    InMemoryVectorIndex,
++    StaticLanguageDetector,
++    StaticTopicClassifier,
++)
++
++_TEXT = (
++    "La ingenieria de software estudia el diseno de sistemas complejos. "
++    "Los algoritmos y las estructuras de datos son la base de todo programa.\n\n"
++    "Un segundo parrafo habla de arquitectura hexagonal y puertos. "
++    "Los adaptadores conectan el dominio con la infraestructura externa."
++)
++
++
++@pytest.fixture()
++def client():
++    documents = InMemoryDocumentRepository()
++    chunks = InMemoryChunkRepository()
++    chunks.bind_documents(documents)
++    vector_index = InMemoryVectorIndex(dimension=8)
++    embeddings = HashingEmbeddingModel(dimension=8)
++    language_detector = StaticLanguageDetector()
++    topic_classifier = StaticTopicClassifier()
++    chunker = HybridChunker(WordTokenCounter(), min_tokens=5, max_tokens=30, overlap_ratio=0.0)
++
++    indexing_pipeline = IndexingPipeline(
++        chunker=chunker,
++        embedding_model=embeddings,
++        language_detector=language_detector,
++        topic_classifier=topic_classifier,
++        vector_index=vector_index,
++        document_repository=documents,
++        chunk_repository=chunks,
++    )
++    search_pipeline = SearchPipeline(
++        chunker=chunker,
++        embedding_model=embeddings,
++        language_detector=language_detector,
++        topic_classifier=topic_classifier,
++        candidate_filter=CandidateFilter(documents, chunks),
++        vector_index=vector_index,
++        result_aggregator=ResultAggregator(chunks),
++    )
++
++    dependencies = AppDependencies(
++        document_repository=documents,
++        chunk_repository=chunks,
++        language_detector=language_detector,
++        topic_classifier=topic_classifier,
++        search_pipeline=search_pipeline,
++        reranker=Reranker(chunks),
++        plagiarism_scorer=PlagiarismScorer(),
++        indexing_pipeline=indexing_pipeline,
++        document_deleter=DocumentDeleter(documents, chunks, vector_index),
++        vector_index=vector_index,
++    )
++
++    app = create_app(dependencies)
++    app.config["TESTING"] = True
++    with app.test_client() as test_client:
++        yield test_client
++
++
++def _index(client, **overrides):
++    payload = {
++        "text": _TEXT,
++        "tenant_id": "tenant-a",
++        "filename": "tesis.txt",
++        "titulo": "Tesis X",
++        "autores": ["Ana Ruiz"],
++        "institucion": "Universidad Nacional",
++        "pais": "Peru",
++    }
++    payload.update(overrides)
++    return client.post("/index", json=payload)
++
++
++def test_index_returns_201_with_chunk_count(client) -> None:
++    response = _index(client)
++
++    assert response.status_code == 201
++    body = response.get_json()
++    assert body["chunks_indexed"] > 0
++    assert body["duplicate"] is False
++    assert body["idioma"] == "es"
++    assert body["tema"] == "Ingenieria"
++    assert body["document_id"]
++
++
++def test_index_same_text_twice_reports_duplicate(client) -> None:
++    first = _index(client).get_json()
++    response = _index(client)
++
++    assert response.status_code == 200
++    body = response.get_json()
++    assert body["duplicate"] is True
++    assert body["document_id"] == first["document_id"]
++    assert body["chunks_indexed"] == 0
++
++
++def test_index_same_text_other_tenant_is_not_duplicate(client) -> None:
++    _index(client)
++    response = _index(client, tenant_id="tenant-b")
++
++    assert response.status_code == 201
++    assert response.get_json()["duplicate"] is False
++
++
++def test_index_empty_text_returns_400(client) -> None:
++    response = _index(client, text="   \n\n  ")
++    assert response.status_code == 400
++    assert response.get_json()["error"] == "empty_document"
++
++
++def test_index_explicit_language_overrides_detection(client) -> None:
++    response = _index(client, idioma="en")
++    assert response.status_code == 201
++    assert response.get_json()["idioma"] == "en"
++
++
++def test_list_documents_with_dynamic_filters(client) -> None:
++    _index(client)
++    _index(
++        client,
++        text=_TEXT + " Texto adicional distinto.",
++        institucion="Universidad de Chile",
++        pais="Chile",
++    )
++
++    everything = client.get("/documents?tenant_id=tenant-a").get_json()
++    assert len(everything["documents"]) == 2
++
++    by_country = client.get("/documents?tenant_id=tenant-a&pais=peru").get_json()
++    assert len(by_country["documents"]) == 1
++    assert by_country["documents"][0]["pais"] == "Peru"
++
++    by_institution = client.get(
++        "/documents?tenant_id=tenant-a&institucion=Universidad%20de%20Chile"
++    ).get_json()
++    assert len(by_institution["documents"]) == 1
++
++    combined = client.get(
++        "/documents?tenant_id=tenant-a&idioma=es&tema=Ingenieria&pais=Chile"
++    ).get_json()
++    assert len(combined["documents"]) == 1
++
++    nothing = client.get("/documents?tenant_id=tenant-a&pais=Argentina").get_json()
++    assert nothing["documents"] == []
++
++
++def test_list_documents_requires_tenant(client) -> None:
++    assert client.get("/documents").status_code == 400
++
++
++def test_get_document_detail_includes_chunk_count(client) -> None:
++    document_id = _index(client).get_json()["document_id"]
++
++    response = client.get(f"/documents/{document_id}?tenant_id=tenant-a")
++
++    assert response.status_code == 200
++    body = response.get_json()
++    assert body["id"] == document_id
++    assert body["documento"] == "tesis.txt"
++    assert body["chunks"] > 0
++    assert body["estado"] == "INDEXED"
++
++
++def test_get_document_cross_tenant_is_404(client) -> None:
++    document_id = _index(client).get_json()["document_id"]
++    response = client.get(f"/documents/{document_id}?tenant_id=tenant-b")
++    assert response.status_code == 404
++
++
++def test_indexed_text_is_found_by_search(client) -> None:
++    _index(client)
++
++    response = client.post(
++        "/search",
++        json={"text": _TEXT, "tenant_id": "tenant-a"},
++    )
++
++    assert response.status_code == 200
++    body = response.get_json()
++    assert len(body["documents"]) == 1
++    assert body["documents"][0]["documento"] == "tesis.txt"
++    assert body["documents"][0]["similaridad"] > 50.0
++
++
++def test_delete_document_removes_everything(client) -> None:
++    document_id = _index(client).get_json()["document_id"]
++
++    response = client.delete(f"/documents/{document_id}?tenant_id=tenant-a")
++    assert response.status_code == 200
++    assert response.get_json() == {"deleted": True, "document_id": document_id}
++
++    assert client.get(f"/documents/{document_id}?tenant_id=tenant-a").status_code == 404
++
++    search = client.post("/search", json={"text": _TEXT, "tenant_id": "tenant-a"}).get_json()
++    assert search["documents"] == []
++
++    stats = client.get("/stats?tenant_id=tenant-a").get_json()
++    assert stats["documents"] == 0
++    assert stats["chunks"] == 0
++
++
++def test_delete_cross_tenant_is_404_and_keeps_document(client) -> None:
++    document_id = _index(client).get_json()["document_id"]
++
++    assert client.delete(f"/documents/{document_id}?tenant_id=tenant-b").status_code == 404
++    assert client.get(f"/documents/{document_id}?tenant_id=tenant-a").status_code == 200
++
++
++def test_delete_missing_document_is_404(client) -> None:
++    assert client.delete("/documents/no-such-id?tenant_id=tenant-a").status_code == 404
++
++
++def test_stats_reports_corpus_size(client) -> None:
++    _index(client)
++    _index(client, text=_TEXT + " Mas contenido unico.", tenant_id="tenant-a")
++    _index(client, tenant_id="tenant-b")
++
++    response = client.get("/stats?tenant_id=tenant-a")
++
++    assert response.status_code == 200
++    body = response.get_json()
++    assert body["documents"] == 2
++    assert body["chunks"] > 0
++    assert body["index_dimension"] == 8
+diff --git a/tests/integration/test_search_api.py b/tests/integration/test_search_api.py
+index 26e23dd..164c3ba 100644
+--- a/tests/integration/test_search_api.py
++++ b/tests/integration/test_search_api.py
+@@ -12,6 +12,8 @@ import pytest
+ 
+ from app.api.app_factory import create_app
+ from app.api.dependencies import AppDependencies
++from app.application.indexing.document_deleter import DocumentDeleter
++from app.application.indexing.indexing_pipeline import IndexingPipeline
+ from app.application.ranking.plagiarism_scorer import PlagiarismScorer
+ from app.application.ranking.reranker import Reranker
+ from app.application.search.candidate_filter import CandidateFilter
+@@ -87,6 +89,22 @@ class _FakeVectorIndex:
+         return self._hits.get(key, [])[:k]
+ 
+ 
++def _extra_dependencies(document_repository, chunk_repository, vector_index, chunker):
++    """The AppDependencies fields the search tests never invoke: the
++    constructors only store references, so the scripted fakes suffice."""
++    pipeline = IndexingPipeline(
++        chunker=chunker,
++        embedding_model=_FakeEmbeddingModel(),
++        language_detector=_FakeLanguageDetector(),
++        topic_classifier=_FakeTopicClassifier(),
++        vector_index=vector_index,
++        document_repository=document_repository,
++        chunk_repository=chunk_repository,
++    )
++    deleter = DocumentDeleter(document_repository, chunk_repository, vector_index)
++    return pipeline, deleter
++
++
+ def _document() -> Document:
+     return Document(
+         id="doc-1",
+@@ -112,8 +130,9 @@ def client():
+     document_repository = _FakeDocumentRepository([document])
+     chunk_repository = _FakeChunkRepository(chunk_map, chunks)
+ 
++    chunker = HybridChunker(WordTokenCounter(), min_tokens=3, max_tokens=20, overlap_ratio=0.0)
+     pipeline = SearchPipeline(
+-        chunker=HybridChunker(WordTokenCounter(), min_tokens=3, max_tokens=20, overlap_ratio=0.0),
++        chunker=chunker,
+         embedding_model=_FakeEmbeddingModel(),
+         language_detector=_FakeLanguageDetector(),
+         topic_classifier=_FakeTopicClassifier(),
+@@ -122,6 +141,9 @@ def client():
+         result_aggregator=ResultAggregator(chunk_repository),
+     )
+ 
++    indexing_pipeline, document_deleter = _extra_dependencies(
++        document_repository, chunk_repository, vector_index, chunker
++    )
+     dependencies = AppDependencies(
+         document_repository=document_repository,
+         chunk_repository=chunk_repository,
+@@ -130,6 +152,9 @@ def client():
+         search_pipeline=pipeline,
+         reranker=Reranker(chunk_repository),
+         plagiarism_scorer=PlagiarismScorer(),
++        indexing_pipeline=indexing_pipeline,
++        document_deleter=document_deleter,
++        vector_index=vector_index,
+     )
+ 
+     app = create_app(dependencies)
+@@ -204,22 +229,32 @@ def test_search_no_matches_returns_empty_documents(client) -> None:
+ def test_unknown_route_returns_404_json() -> None:
+     from app.api.app_factory import create_app as factory
+ 
++    document_repository = _FakeDocumentRepository([])
++    chunk_repository = _FakeChunkRepository({}, [])
++    vector_index = _FakeVectorIndex({})
++    chunker = HybridChunker(WordTokenCounter(), min_tokens=3, max_tokens=20, overlap_ratio=0.0)
++    indexing_pipeline, document_deleter = _extra_dependencies(
++        document_repository, chunk_repository, vector_index, chunker
++    )
+     dependencies = AppDependencies(
+-        document_repository=_FakeDocumentRepository([]),
+-        chunk_repository=_FakeChunkRepository({}, []),
++        document_repository=document_repository,
++        chunk_repository=chunk_repository,
+         language_detector=_FakeLanguageDetector(),
+         topic_classifier=_FakeTopicClassifier(),
+         search_pipeline=SearchPipeline(
+-            chunker=HybridChunker(WordTokenCounter(), min_tokens=3, max_tokens=20, overlap_ratio=0.0),
++            chunker=chunker,
+             embedding_model=_FakeEmbeddingModel(),
+             language_detector=_FakeLanguageDetector(),
+             topic_classifier=_FakeTopicClassifier(),
+-            candidate_filter=CandidateFilter(_FakeDocumentRepository([]), _FakeChunkRepository({}, [])),
+-            vector_index=_FakeVectorIndex({}),
+-            result_aggregator=ResultAggregator(_FakeChunkRepository({}, [])),
++            candidate_filter=CandidateFilter(document_repository, chunk_repository),
++            vector_index=vector_index,
++            result_aggregator=ResultAggregator(chunk_repository),
+         ),
+-        reranker=Reranker(_FakeChunkRepository({}, [])),
++        reranker=Reranker(chunk_repository),
+         plagiarism_scorer=PlagiarismScorer(),
++        indexing_pipeline=indexing_pipeline,
++        document_deleter=document_deleter,
++        vector_index=vector_index,
+     )
+     app = factory(dependencies)
+     with app.test_client() as test_client:
+diff --git a/tests/unit/application/indexing/__init__.py b/tests/unit/application/indexing/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/unit/application/indexing/test_chunk_id_factory.py b/tests/unit/application/indexing/test_chunk_id_factory.py
+new file mode 100644
+index 0000000..fa789b0
+--- /dev/null
++++ b/tests/unit/application/indexing/test_chunk_id_factory.py
+@@ -0,0 +1,28 @@
++import pytest
++
++from app.application.indexing.chunk_id_factory import chunk_id_for
++
++
++def test_deterministic_for_same_inputs() -> None:
++    assert chunk_id_for("doc-1", 0) == chunk_id_for("doc-1", 0)
++
++
++def test_differs_across_orders_and_documents() -> None:
++    ids = {
++        chunk_id_for("doc-1", 0),
++        chunk_id_for("doc-1", 1),
++        chunk_id_for("doc-2", 0),
++        chunk_id_for("doc-2", 1),
++    }
++    assert len(ids) == 4
++
++
++def test_fits_in_signed_bigint() -> None:
++    for order in range(100):
++        chunk_id = chunk_id_for("some-uuid-value", order)
++        assert 0 <= chunk_id < 2**63
++
++
++def test_negative_order_rejected() -> None:
++    with pytest.raises(ValueError):
++        chunk_id_for("doc-1", -1)
+diff --git a/tests/unit/application/indexing/test_document_deleter.py b/tests/unit/application/indexing/test_document_deleter.py
+new file mode 100644
+index 0000000..5b349d2
+--- /dev/null
++++ b/tests/unit/application/indexing/test_document_deleter.py
+@@ -0,0 +1,63 @@
++from __future__ import annotations
++
++import pytest
++
++from app.application.indexing.document_deleter import DocumentDeleter
++from app.application.indexing.indexing_pipeline import IndexCommand, IndexingPipeline
++from app.infrastructure.chunking.hybrid_chunker import HybridChunker
++from app.infrastructure.chunking.word_token_counter import WordTokenCounter
++from tests.integration.inmemory import (
++    HashingEmbeddingModel,
++    InMemoryChunkRepository,
++    InMemoryDocumentRepository,
++    InMemoryVectorIndex,
++    StaticLanguageDetector,
++    StaticTopicClassifier,
++)
++
++_TEXT = "Contenido academico de prueba con palabras suficientes para un segmento."
++
++
++@pytest.fixture()
++def stack():
++    documents = InMemoryDocumentRepository()
++    chunks = InMemoryChunkRepository()
++    chunks.bind_documents(documents)
++    vector_index = InMemoryVectorIndex(dimension=8)
++    pipeline = IndexingPipeline(
++        chunker=HybridChunker(WordTokenCounter(), min_tokens=2, max_tokens=30, overlap_ratio=0.0),
++        embedding_model=HashingEmbeddingModel(dimension=8),
++        language_detector=StaticLanguageDetector(),
++        topic_classifier=StaticTopicClassifier(),
++        vector_index=vector_index,
++        document_repository=documents,
++        chunk_repository=chunks,
++    )
++    deleter = DocumentDeleter(documents, chunks, vector_index)
++    return pipeline, deleter, documents, chunks, vector_index
++
++
++def test_delete_removes_document_chunks_and_vectors(stack) -> None:
++    pipeline, deleter, documents, chunks, vector_index = stack
++    result = pipeline.index(IndexCommand(text=_TEXT, tenant_id="tenant-a"))
++
++    assert deleter.delete(result.document_id, "tenant-a") is True
++
++    assert documents.by_id(result.document_id) is None
++    assert chunks.by_document(result.document_id) == []
++    assert len(vector_index) == 0
++
++
++def test_delete_wrong_tenant_refused(stack) -> None:
++    pipeline, deleter, documents, _chunks, vector_index = stack
++    result = pipeline.index(IndexCommand(text=_TEXT, tenant_id="tenant-a"))
++
++    assert deleter.delete(result.document_id, "tenant-b") is False
++
++    assert documents.by_id(result.document_id) is not None
++    assert len(vector_index) > 0
++
++
++def test_delete_missing_document_returns_false(stack) -> None:
++    _pipeline, deleter, _d, _c, _v = stack
++    assert deleter.delete("missing-id", "tenant-a") is False
+diff --git a/tests/unit/application/indexing/test_indexing_pipeline.py b/tests/unit/application/indexing/test_indexing_pipeline.py
+new file mode 100644
+index 0000000..655571e
+--- /dev/null
++++ b/tests/unit/application/indexing/test_indexing_pipeline.py
+@@ -0,0 +1,137 @@
++"""IndexingPipeline behavior over in-memory fakes: dedup short-circuit,
++metadata overrides, chunk/vector consistency, idempotent chunk ids."""
++
++from __future__ import annotations
++
++import pytest
++
++from app.application.indexing.document_deleter import DocumentDeleter
++from app.application.indexing.indexing_pipeline import (
++    EmptyDocumentError,
++    IndexCommand,
++    IndexingPipeline,
++)
++from app.domain.entities.document_status import DocumentStatus
++from app.domain.value_objects.bibliographic_metadata import BibliographicMetadata
++from app.infrastructure.chunking.hybrid_chunker import HybridChunker
++from app.infrastructure.chunking.word_token_counter import WordTokenCounter
++from tests.integration.inmemory import (
++    HashingEmbeddingModel,
++    InMemoryChunkRepository,
++    InMemoryDocumentRepository,
++    InMemoryVectorIndex,
++    StaticLanguageDetector,
++    StaticTopicClassifier,
++)
++
++_TEXT = (
++    "Primer parrafo con contenido academico suficiente para un segmento completo.\n\n"
++    "Segundo parrafo con mas contenido tecnico y otras palabras distintas."
++)
++
++
++@pytest.fixture()
++def stack():
++    documents = InMemoryDocumentRepository()
++    chunks = InMemoryChunkRepository()
++    chunks.bind_documents(documents)
++    vector_index = InMemoryVectorIndex(dimension=8)
++    pipeline = IndexingPipeline(
++        chunker=HybridChunker(WordTokenCounter(), min_tokens=5, max_tokens=30, overlap_ratio=0.0),
++        embedding_model=HashingEmbeddingModel(dimension=8),
++        language_detector=StaticLanguageDetector(),
++        topic_classifier=StaticTopicClassifier(),
++        vector_index=vector_index,
++        document_repository=documents,
++        chunk_repository=chunks,
++    )
++    return pipeline, documents, chunks, vector_index
++
++
++def test_index_persists_document_chunks_and_vectors(stack) -> None:
++    pipeline, documents, chunks, vector_index = stack
++
++    result = pipeline.index(IndexCommand(text=_TEXT, tenant_id="tenant-a"))
++
++    assert result.duplicate is False
++    assert result.chunks_indexed > 0
++
++    document = documents.by_id(result.document_id)
++    assert document is not None
++    assert document.status == DocumentStatus.INDEXED
++    assert document.indexed_at is not None
++    assert document.source.mime == "text/plain"
++
++    stored_chunks = chunks.by_document(result.document_id)
++    assert len(stored_chunks) == result.chunks_indexed
++    assert len(vector_index) == result.chunks_indexed
++
++
++def test_duplicate_short_circuits_before_touching_index(stack) -> None:
++    pipeline, _documents, _chunks, vector_index = stack
++
++    first = pipeline.index(IndexCommand(text=_TEXT, tenant_id="tenant-a"))
++    vectors_after_first = len(vector_index)
++
++    second = pipeline.index(IndexCommand(text=_TEXT, tenant_id="tenant-a"))
++
++    assert second.duplicate is True
++    assert second.document_id == first.document_id
++    assert second.chunks_indexed == 0
++    assert len(vector_index) == vectors_after_first
++
++
++def test_whitespace_variations_hash_to_same_document(stack) -> None:
++    pipeline, _d, _c, _v = stack
++
++    first = pipeline.index(IndexCommand(text=_TEXT, tenant_id="tenant-a"))
++    second = pipeline.index(
++        IndexCommand(text=_TEXT.replace("\n\n", "\n\n\n\n") + "\n  \n", tenant_id="tenant-a")
++    )
++
++    assert second.duplicate is True
++    assert second.document_id == first.document_id
++
++
++def test_provided_metadata_overrides_detection(stack) -> None:
++    pipeline, documents, _c, _v = stack
++
++    result = pipeline.index(
++        IndexCommand(
++            text=_TEXT,
++            tenant_id="tenant-a",
++            language_code="en",
++            topic_domain="Derecho",
++            bibliography=BibliographicMetadata(institution="Universidad X", country="Bolivia"),
++        )
++    )
++
++    assert result.language_code == "en"
++    assert result.topic_domain == "Derecho"
++    document = documents.by_id(result.document_id)
++    assert document.language.code == "en"
++    assert document.topic.domain == "Derecho"
++    assert document.bibliography.country == "Bolivia"
++
++
++def test_empty_text_raises(stack) -> None:
++    pipeline, _d, _c, _v = stack
++    with pytest.raises(EmptyDocumentError):
++        pipeline.index(IndexCommand(text="  \n \n ", tenant_id="tenant-a"))
++
++
++def test_delete_then_reindex_same_text_succeeds(stack) -> None:
++    """Deterministic chunk ids must not collide with a deleted document's
++    leftovers: delete removes vectors, reindex mints a new document uuid."""
++    pipeline, documents, chunks, vector_index = stack
++    deleter = DocumentDeleter(documents, chunks, vector_index)
++
++    first = pipeline.index(IndexCommand(text=_TEXT, tenant_id="tenant-a"))
++    assert deleter.delete(first.document_id, "tenant-a") is True
++    assert len(vector_index) == 0
++
++    second = pipeline.index(IndexCommand(text=_TEXT, tenant_id="tenant-a"))
++
++    assert second.duplicate is False
++    assert second.document_id != first.document_id
++    assert len(vector_index) == second.chunks_indexed
+diff --git a/tests/unit/metadata/test_document_filters.py b/tests/unit/metadata/test_document_filters.py
+new file mode 100644
+index 0000000..8f4a0c3
+--- /dev/null
++++ b/tests/unit/metadata/test_document_filters.py
+@@ -0,0 +1,128 @@
++"""SqlAlchemy repository coverage for the Fase 1 additions: institution/
++country filters, counts, and chunk deletion by document."""
++
++from __future__ import annotations
++
++from app.domain.entities.chunk import Chunk
++from app.domain.entities.document import Document
++from app.domain.entities.document_status import DocumentStatus
++from app.domain.value_objects.bibliographic_metadata import BibliographicMetadata
++from app.domain.value_objects.language import Language
++from app.domain.value_objects.pdf_source import PdfSource
++from app.domain.value_objects.sha256_hash import Sha256Hash
++from app.domain.value_objects.token_span import TokenSpan
++from app.domain.value_objects.topic import Topic
++from app.infrastructure.metadata.sqlalchemy_chunk_repository import SqlAlchemyChunkRepository
++from app.infrastructure.metadata.sqlalchemy_document_repository import SqlAlchemyDocumentRepository
++
++
++def _document(
++    doc_id: str,
++    tenant_id: str = "tenant-a",
++    institution: str | None = "Universidad Nacional",
++    country: str | None = "Peru",
++    language: str = "es",
++    topic: str = "Ingenieria",
++) -> Document:
++    return Document(
++        id=doc_id,
++        tenant_id=tenant_id,
++        source=PdfSource(
++            filename=f"{doc_id}.txt", path="inline://text", pages=0, mime="text/plain", size_bytes=10
++        ),
++        content_hash=Sha256Hash.of(doc_id),
++        bibliography=BibliographicMetadata(institution=institution, country=country),
++        language=Language(code=language, confidence=0.9),
++        topic=Topic(domain=topic, confidence=0.9),
++        status=DocumentStatus.INDEXED,
++    )
++
++
++def _chunk(chunk_id: int, document_id: str) -> Chunk:
++    return Chunk(
++        id=chunk_id,
++        document_id=document_id,
++        text="texto",
++        span=TokenSpan(start=0, end=5),
++        order=0,
++    )
++
++
++def test_country_round_trips_through_orm(session) -> None:
++    repo = SqlAlchemyDocumentRepository(session)
++    repo.save(_document("doc-1", country="Chile"))
++
++    fetched = repo.by_id("doc-1")
++    assert fetched is not None
++    assert fetched.bibliography.country == "Chile"
++
++
++def test_list_filters_by_institution_case_insensitive(session) -> None:
++    repo = SqlAlchemyDocumentRepository(session)
++    repo.save(_document("doc-1", institution="Universidad Nacional"))
++    repo.save(_document("doc-2", institution="Universidad de Chile"))
++
++    result = repo.list("tenant-a", institution="universidad nacional")
++
++    assert [d.id for d in result] == ["doc-1"]
++
++
++def test_list_filters_by_country_case_insensitive(session) -> None:
++    repo = SqlAlchemyDocumentRepository(session)
++    repo.save(_document("doc-1", country="Peru"))
++    repo.save(_document("doc-2", country="Chile"))
++
++    result = repo.list("tenant-a", country="CHILE")
++
++    assert [d.id for d in result] == ["doc-2"]
++
++
++def test_list_combines_all_filters(session) -> None:
++    repo = SqlAlchemyDocumentRepository(session)
++    repo.save(_document("doc-1", language="es", topic="Ingenieria", country="Peru"))
++    repo.save(_document("doc-2", language="es", topic="Derecho", country="Peru"))
++    repo.save(_document("doc-3", language="en", topic="Ingenieria", country="Peru"))
++    repo.save(_document("doc-4", language="es", topic="Ingenieria", country="Chile"))
++
++    result = repo.list(
++        "tenant-a", language="es", topic="Ingenieria", country="Peru",
++        institution="Universidad Nacional",
++    )
++
++    assert [d.id for d in result] == ["doc-1"]
++
++
++def test_list_null_metadata_never_matches_filter(session) -> None:
++    repo = SqlAlchemyDocumentRepository(session)
++    repo.save(_document("doc-1", institution=None, country=None))
++
++    assert repo.list("tenant-a", institution="Universidad Nacional") == []
++    assert repo.list("tenant-a", country="Peru") == []
++
++
++def test_document_count_is_tenant_scoped(session) -> None:
++    repo = SqlAlchemyDocumentRepository(session)
++    repo.save(_document("doc-1", tenant_id="tenant-a"))
++    repo.save(_document("doc-2", tenant_id="tenant-a"))
++    repo.save(_document("doc-3", tenant_id="tenant-b"))
++
++    assert repo.count("tenant-a") == 2
++    assert repo.count("tenant-b") == 1
++    assert repo.count("tenant-c") == 0
++
++
++def test_chunk_delete_by_document_and_tenant_count(session) -> None:
++    documents = SqlAlchemyDocumentRepository(session)
++    chunks = SqlAlchemyChunkRepository(session)
++    documents.save(_document("doc-1", tenant_id="tenant-a"))
++    documents.save(_document("doc-2", tenant_id="tenant-b"))
++    chunks.save_all([_chunk(1, "doc-1"), _chunk(2, "doc-2")])
++
++    assert chunks.count_for_tenant("tenant-a") == 1
++    assert chunks.count_for_tenant("tenant-b") == 1
++
++    chunks.delete_by_document("doc-1")
++
++    assert chunks.by_document("doc-1") == []
++    assert chunks.count_for_tenant("tenant-a") == 0
++    assert chunks.count_for_tenant("tenant-b") == 1
+diff --git a/tests/unit/parsers/test_plain_text_normalizer.py b/tests/unit/parsers/test_plain_text_normalizer.py
+new file mode 100644
+index 0000000..ba366cd
+--- /dev/null
++++ b/tests/unit/parsers/test_plain_text_normalizer.py
+@@ -0,0 +1,24 @@
++from app.infrastructure.parsers.plain_text_normalizer import normalize_plain_text
++
++
++def test_normalizes_windows_line_endings() -> None:
++    assert normalize_plain_text("a\r\nb\rc") == "a\nb\nc"
++
++
++def test_collapses_excess_blank_lines_but_keeps_paragraphs() -> None:
++    assert normalize_plain_text("p1\n\n\n\n\np2") == "p1\n\np2"
++
++
++def test_strips_trailing_spaces_and_outer_whitespace() -> None:
++    assert normalize_plain_text("  line one   \nline two\t\n  ") == "line one\nline two"
++
++
++def test_repeated_lines_survive() -> None:
++    # Unlike the PDF TextNormalizer, repeated lines are body content here,
++    # never running headers to strip.
++    text = "estribillo\n\nestrofa\n\nestribillo"
++    assert normalize_plain_text(text) == text
++
++
++def test_empty_input_yields_empty_string() -> None:
++    assert normalize_plain_text(" \n \n ") == ""
+diff --git a/wsgi.py b/wsgi.py
+index 1d7e55c..dd54bf0 100644
+--- a/wsgi.py
++++ b/wsgi.py
+@@ -20,6 +20,8 @@ from sqlalchemy.orm import sessionmaker
+ 
+ from app.api.app_factory import create_app
+ from app.api.dependencies import AppDependencies
++from app.application.indexing.document_deleter import DocumentDeleter
++from app.application.indexing.indexing_pipeline import IndexingPipeline
+ from app.application.ranking.plagiarism_scorer import PlagiarismScorer
+ from app.application.ranking.reranker import Reranker
+ from app.application.search.candidate_filter import CandidateFilter
+@@ -100,6 +102,17 @@ def build_dependencies(settings: AppSettings | None = None) -> AppDependencies:
+     reranker = Reranker(chunk_repository, InstitutionNormalizer())
+     plagiarism_scorer = PlagiarismScorer()
+ 
++    indexing_pipeline = IndexingPipeline(
++        chunker=chunker,
++        embedding_model=embedding_model,
++        language_detector=language_detector,
++        topic_classifier=topic_classifier,
++        vector_index=vector_index,
++        document_repository=document_repository,
++        chunk_repository=chunk_repository,
++    )
++    document_deleter = DocumentDeleter(document_repository, chunk_repository, vector_index)
++
+     return AppDependencies(
+         document_repository=document_repository,
+         chunk_repository=chunk_repository,
+@@ -108,6 +121,9 @@ def build_dependencies(settings: AppSettings | None = None) -> AppDependencies:
+         search_pipeline=search_pipeline,
+         reranker=reranker,
+         plagiarism_scorer=plagiarism_scorer,
++        indexing_pipeline=indexing_pipeline,
++        document_deleter=document_deleter,
++        vector_index=vector_index,
+     )
+ 
+ 
+-- 
+2.43.0
+

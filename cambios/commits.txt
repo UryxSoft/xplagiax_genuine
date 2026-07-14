@@ -1,0 +1,5 @@
+6046bc8 feat: multi-node deployment: nginx LB, scalable web replicas, single indexer worker
+38f0581 feat: async jobs over Redis Streams, single-writer index with WAL and versioned snapshots
+ea33584 feat: resource-diet profile: ONNX backend, preload gunicorn, scoped sessions, L2 cache
+38686f4 feat: plain-text indexing, country metadata, document CRUD and stats endpoints
+234269b feat: add caveman skill for ultra-compressed communication mode

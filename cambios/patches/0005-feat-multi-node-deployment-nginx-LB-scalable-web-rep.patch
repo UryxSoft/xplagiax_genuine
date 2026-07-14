@@ -1,0 +1,280 @@
+From 6046bc86e2811a9dc1aa051822aefda36167b1f8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 14 Jul 2026 18:17:12 +0000
+Subject: [PATCH 5/5] feat: multi-node deployment: nginx LB, scalable web
+ replicas, single indexer worker
+
+Fase 4 of the plain-text manager plan:
+- docker-compose.multinode.yml: nginx entrypoint, N stateless web
+  replicas (read-only index mount, worker_mode), one indexer worker,
+  Redis (AOF) for jobs + shared L2 cache, PostgreSQL
+- deploy/nginx.conf resolves the app service per-request through
+  Docker's DNS so round-robin follows --scale without reloads
+- Makefile targets docker-up-multinode (REPLICAS=n) / docker-down-multinode
+- docs/SCALING.md: the three supported topologies, RAM budget per
+  profile, single-writer rule, and the (idioma, tema) partitioning plan
+  for >50M chunks
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EYjnjSLC45cRbKiBbYcL7u
+---
+ Makefile                     |  9 ++++
+ deploy/nginx.conf            | 33 +++++++++++++
+ docker-compose.multinode.yml | 89 ++++++++++++++++++++++++++++++++++++
+ docs/SCALING.md              | 88 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 219 insertions(+)
+ create mode 100644 deploy/nginx.conf
+ create mode 100644 docker-compose.multinode.yml
+ create mode 100644 docs/SCALING.md
+
+diff --git a/Makefile b/Makefile
+index 3173fd5..03bf18d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -22,6 +22,15 @@ docker-up:
+ docker-up-full:
+ 	docker compose --profile with-grobid up -d
+ 
++# Multi-node topology (docs/SCALING.md): nginx + N web replicas +
++# single indexer worker + redis. Scale reads with REPLICAS=n.
++REPLICAS ?= 2
++docker-up-multinode:
++	docker compose -f docker-compose.multinode.yml up -d --scale app=$(REPLICAS)
++
++docker-down-multinode:
++	docker compose -f docker-compose.multinode.yml down
++
+ docker-down:
+ 	docker compose down
+ 
+diff --git a/deploy/nginx.conf b/deploy/nginx.conf
+new file mode 100644
+index 0000000..c964439
+--- /dev/null
++++ b/deploy/nginx.conf
+@@ -0,0 +1,33 @@
++# Load balancer for the multi-node topology (docs/SCALING.md).
++#
++# Docker's embedded DNS (127.0.0.11) returns every replica of the "app"
++# service; resolving per-request (variable + resolver, valid=5s) makes
++# nginx round-robin across replicas and pick up scale changes without a
++# reload -- a static upstream block would pin the IPs resolved at startup.
++
++worker_processes auto;
++
++events {
++    worker_connections 1024;
++}
++
++http {
++    resolver 127.0.0.11 valid=5s ipv6=off;
++
++    # /search bodies and /index payloads are full documents
++    client_max_body_size 50m;
++
++    server {
++        listen 80;
++
++        location / {
++            set $backend http://app:8000;
++            proxy_pass $backend;
++            proxy_http_version 1.1;
++            proxy_set_header Host $host;
++            proxy_set_header X-Request-Id $request_id;
++            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
++            proxy_read_timeout 120s;
++        }
++    }
++}
+diff --git a/docker-compose.multinode.yml b/docker-compose.multinode.yml
+new file mode 100644
+index 0000000..0d79c3c
+--- /dev/null
++++ b/docker-compose.multinode.yml
+@@ -0,0 +1,89 @@
++# Multi-node topology (Fase 3/4, ADR-010 single-writer): N stateless web
++# replicas behind nginx, ONE indexer worker owning the index, Redis for
++# jobs + shared L2 cache, PostgreSQL for metadata.
++#
++#   docker compose -f docker-compose.multinode.yml up -d --scale app=3
++#
++# Read scaling = more app replicas (the index directory is mounted
++# read-only in them; the manifest hot-reload picks up new versions).
++# Write scaling stays at exactly one worker: do NOT scale the worker
++# service without partitioning the index first (docs/SCALING.md).
++
++services:
++  nginx:
++    image: nginx:1.27-alpine
++    ports:
++      - "8000:80"
++    volumes:
++      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
++    depends_on:
++      - app
++    restart: unless-stopped
++
++  app:
++    build: .
++    # no host port: nginx is the single entrypoint, replicas stay scalable
++    environment:
++      DATABASE_URL: postgresql+psycopg://xplagiax:xplagiax@postgres:5432/xplagiax
++      REDIS_URL: redis://redis:6379/0
++      INDEX_WRITE_MODE: worker
++      INDEX_DATA_DIR: /data/turbovec
++      WEB_CONCURRENCY: 2
++    volumes:
++      - turbovec_data:/data/turbovec:ro
++    depends_on:
++      postgres:
++        condition: service_healthy
++      redis:
++        condition: service_healthy
++    restart: unless-stopped
++
++  worker:
++    build: .
++    command: ["python", "-m", "app.workers.indexer_worker"]
++    environment:
++      DATABASE_URL: postgresql+psycopg://xplagiax:xplagiax@postgres:5432/xplagiax
++      REDIS_URL: redis://redis:6379/0
++      INDEX_DATA_DIR: /data/turbovec
++      INDEX_CHECKPOINT_EVERY_OPS: 50
++      JOBS_CONSUMER_NAME: worker-1
++    volumes:
++      - turbovec_data:/data/turbovec
++    depends_on:
++      postgres:
++        condition: service_healthy
++      redis:
++        condition: service_healthy
++    restart: unless-stopped
++
++  redis:
++    image: redis:7-alpine
++    command: ["redis-server", "--appendonly", "yes"]
++    volumes:
++      - redis_data:/data
++    healthcheck:
++      test: ["CMD", "redis-cli", "ping"]
++      interval: 5s
++      timeout: 3s
++      retries: 10
++    restart: unless-stopped
++
++  postgres:
++    image: postgres:16-alpine
++    environment:
++      POSTGRES_DB: xplagiax
++      POSTGRES_USER: xplagiax
++      POSTGRES_PASSWORD: xplagiax
++    volumes:
++      - postgres_data:/var/lib/postgresql/data
++    healthcheck:
++      test: ["CMD-SHELL", "pg_isready -U xplagiax"]
++      interval: 5s
++      timeout: 5s
++      retries: 10
++    restart: unless-stopped
++
++volumes:
++  postgres_data:
++  redis_data:
++  turbovec_data:
+diff --git a/docs/SCALING.md b/docs/SCALING.md
+new file mode 100644
+index 0000000..ec6caf0
+--- /dev/null
++++ b/docs/SCALING.md
+@@ -0,0 +1,88 @@
++# Escalado de xPlagiaX — topologías y presupuesto de recursos
++
++Complemento operativo de `ARCHITECTURE.md` (ADR-007/010). Describe las tres
++topologías soportadas, cuándo pasar de una a otra y el presupuesto de RAM
++que justifica cada decisión.
++
++## Por qué NO Elasticsearch para este servicio
++
++Cada nodo Elasticsearch es una JVM con 2–4 GB de heap mínimo antes de
++indexar un solo documento — incompatible con el objetivo de "servicio
++pluma" (NFR-03: < 0.5 GB residentes por nodo). TurboVec cuantizado + mmap
++cubre decenas de millones de chunks en un solo archivo replicable; la
++distribución se resuelve con réplicas stateless, no con un cluster.
++
++## Presupuesto de RAM por proceso web
++
++| Componente | float32 e5-large | Perfil pluma (ONNX e5-small int8) |
++|---|---|---|
++| Modelo de embeddings | ~2.24 GB | ~120 MB |
++| Flask + deps | ~150 MB | ~150 MB |
++| Índice TurboVec | RSS acotado por mmap (working set) | igual, y 384 dims ≈ 2.7× menos disco |
++| **Total por worker gunicorn** | **> 2.4 GB** | **< 500 MB** |
++
++Con `preload_app` (gunicorn.conf.py) el modelo se carga una vez en el
++master y los workers lo comparten copy-on-write: N workers ≈ 1× modelo,
++no N×.
++
++## Topología 1 — single-node (default)
++
++```
++docker compose up -d
++```
++
++Un proceso web posee el índice (`INDEX_WRITE_MODE=local`), escrituras
++sincrónicas, jobs inline. Sirve hasta que la CPU de un nodo se queda corta
++o necesitas ingestión sin bloquear búsquedas.
++
++## Topología 2 — multi-nodo lectura escalada (la que cubre el 99%)
++
++```
++docker compose -f docker-compose.multinode.yml up -d --scale app=3
++```
++
++```
++                nginx (LB, DNS round-robin)
++               /       |        \
++          app x N réplicas (INDEX_WRITE_MODE=worker, índice :ro)
++               \       |        /
++                Redis (jobs + cache L2)   PostgreSQL (metadata)
++                        |
++                worker indexador (ÚNICO writer: WAL + snapshots versionados)
++                        |
++                volumen turbovec_data (manifest + index.vN)
++```
++
++- Las réplicas web son stateless y solo-lectura sobre el índice: escalar
++  lectura = `--scale app=N`. El hot-reload por manifest hace que cada
++  réplica adopte la versión nueva del índice sin reinicio.
++- Toda escritura (`POST /index`, `DELETE /documents/{id}`) viaja como job
++  por Redis Streams al worker. **Nunca escales el worker a más de 1** sin
++  particionar antes (abajo): el diseño es single-writer por directorio de
++  índice.
++- Durabilidad: WAL fsync + checkpoints (`INDEX_CHECKPOINT_EVERY_OPS`);
++  recuperación = snapshot del manifest + replay del WAL.
++- La cache L2 en Redis comparte invalidación entre réplicas: indexar en el
++  worker invalida el namespace del tenant para todos.
++
++## Topología 3 — particionado (solo > ~50M chunks)
++
++No implementada; plan cuando llegue la presión real:
++
++1. Particionar por **(idioma, tema)** — partición natural: el filtro-primero
++   (ADR-004) ya enruta cada búsqueda a un solo par idioma+tema, así que el
++   coordinador manda cada query a UNA partición y solo hace fan-out en
++   búsquedas sin filtro.
++2. Un worker single-writer **por partición** (directorio de índice propio),
++   mismo código de Fase 3.
++3. Evitar `hash(id) % N`: destruye la localidad idioma+tema que es la
++   ventaja de CPU/RAM de este diseño.
++
++## Señales para cambiar de topología
++
++| Señal | Acción |
++|---|---|
++| CPU sostenida > 70% en el nodo web | Topología 2, añadir réplicas |
++| Ingestión bloquea búsquedas | Topología 2 (writer separado) |
++| P95 de búsqueda degradado con réplicas ociosas | Revisar cache L2 / calentar mmap, no escalar |
++| Corpus > ~50M chunks o WAL/checkpoint dominan E/S | Topología 3 (particionar) |
+-- 
+2.43.0
+

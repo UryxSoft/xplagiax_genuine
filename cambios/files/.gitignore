@@ -1,0 +1,20 @@
+# Build/deliverable artifacts
+*.tar.gz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Index/data
+*.tvim
+*.tv
+*.parquet
+
+# IDE
+.idea/
+.vscode/
+.pytest_cache/
+*.egg-info/

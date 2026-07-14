@@ -1,0 +1,29 @@
+xPlagiaX - cambios Fases 1-4 (branch claude/caveman-mode-s747qr, base: main @ 3a59ee3)
+
+Contenido:
+  xplagiax-cambios.bundle  Commits exactos (5, con firma y autoria). Forma recomendada.
+  patches/                 Mismos commits como parches git format-patch.
+  files/                   Archivos nuevos/modificados en su estructura final.
+  commits.txt              Lista de commits.
+  archivos-borrados.txt    Archivos eliminados (vacio = ninguno).
+
+Aplicar (opcion A, recomendada - preserva commits y firmas):
+  cd xplagiax_genuine
+  git fetch /ruta/a/xplagiax-cambios.bundle claude/caveman-mode-s747qr:claude/caveman-mode-s747qr
+  git push -u origin claude/caveman-mode-s747qr
+
+Aplicar (opcion B - parches):
+  git checkout -b claude/caveman-mode-s747qr main
+  git am patches/*.patch
+
+Aplicar (opcion C - copiar archivos):
+  copiar el contenido de files/ sobre la raiz del repo y commitear.
+
+Fases incluidas:
+  1. POST /index texto plano, campo pais, GET/DELETE /documents con filtros dinamicos, /stats
+  2. Backend ONNX de embeddings, gunicorn preload, sesiones request-scoped, cache L2 (memoria/Redis)
+  3. Jobs async (mode=async + GET /jobs/{id}), Redis Streams, worker indexador unico,
+     WAL + snapshots versionados + hot-reload de indice
+  4. docker-compose.multinode.yml (nginx + N replicas + worker + redis), docs/SCALING.md
+
+Tests: 253 en verde (pytest tests/).
