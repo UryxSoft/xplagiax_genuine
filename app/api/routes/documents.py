@@ -13,6 +13,7 @@ from app.api.dependencies import AppDependencies
 from app.api.schemas import (
     DocumentListResponseSchema,
     DocumentSummarySchema,
+    JobSubmittedSchema,
     StatsResponseSchema,
 )
 from app.domain.entities.document import Document
@@ -91,6 +92,11 @@ def delete_document(document_id: str):
     tenant_id = _require_tenant()
     if tenant_id is None:
         return jsonify({"error": "invalid_request", "message": "tenant_id query parameter is required"}), 400
+
+    if deps.worker_mode:
+        # read-only replica: deletion is a job for the indexer worker
+        job_id = deps.job_service.submit_delete(document_id, tenant_id)
+        return jsonify(JobSubmittedSchema(job_id=job_id, status="PENDING").model_dump()), 202
 
     deleted = deps.document_deleter.delete(document_id, tenant_id)
     if not deleted:

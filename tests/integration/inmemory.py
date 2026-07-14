@@ -120,12 +120,34 @@ class InMemoryChunkRepository:
 
 
 class InMemoryVectorIndex:
-    """Brute-force cosine search over stored vectors, allowlist-aware."""
+    """Brute-force cosine search over stored vectors, allowlist-aware.
+
+    write_to/from_file give it the same checkpoint surface as
+    TurboVecRepository so the persistence-layer tests (VersionedIndexWriter,
+    HotReloadingVectorIndex) can run real save/load cycles without the
+    native library.
+    """
 
     def __init__(self, dimension: int = 8) -> None:
         self._dimension = dimension
         self._vectors: dict[int, EmbeddingVector] = {}
         self._version = 0
+
+    @classmethod
+    def from_file(cls, path, dimension: int = 8) -> "InMemoryVectorIndex":
+        import json
+
+        instance = cls(dimension=dimension)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for chunk_id, values in data.items():
+            instance._vectors[int(chunk_id)] = EmbeddingVector(values=tuple(values))
+        return instance
+
+    def write_to(self, path) -> None:
+        import json
+
+        payload = {str(i): list(v.values) for i, v in self._vectors.items()}
+        path.write_text(json.dumps(payload), encoding="utf-8")
 
     @property
     def dimension(self) -> int:

@@ -30,6 +30,19 @@ class AppSettings(BaseSettings):
     turbovec_index_path: Path = Field(default=Path("/data/turbovec/index.tvim"))
     turbovec_bit_width: int = Field(default=4)
 
+    # --- Fase 3: single-writer topology (ADR-010) ---
+    # "local": this process owns the index and writes synchronously.
+    # "worker": web replicas hold a read-only hot-reloading view; every
+    # write becomes a job for the indexer worker (requires redis_url).
+    index_write_mode: str = Field(default="local", pattern="^(local|worker)$")
+    index_data_dir: Path = Field(default=Path("/data/turbovec"))
+    index_checkpoint_every_ops: int = Field(default=50, gt=0)
+
+    jobs_stream_key: str = Field(default="xplagiax:jobs")
+    jobs_consumer_group: str = Field(default="xplagiax-workers")
+    jobs_consumer_name: str = Field(default="worker-1")
+    job_ttl_seconds: int = Field(default=7 * 24 * 3600, gt=0)
+
     chunk_min_tokens: int = Field(default=300, gt=0)
     chunk_max_tokens: int = Field(default=500, gt=0)
     chunk_overlap_ratio: float = Field(default=0.2, ge=0.0, lt=1.0)

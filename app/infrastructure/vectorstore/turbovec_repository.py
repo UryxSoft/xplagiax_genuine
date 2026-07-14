@@ -96,6 +96,12 @@ class TurboVecRepository:
         self._index.write(str(self._index_path))
         self._version += 1
 
+    def write_to(self, path: Path) -> None:
+        """Writes the index to an arbitrary path (versioned checkpoints,
+        ADR-010) without touching the adapter's own index_path/version."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._index.write(str(path))
+
     def _validate_dimensions(self, vectors: list[EmbeddingVector]) -> None:
         for vector in vectors:
             if vector.dimension != self._dimension:

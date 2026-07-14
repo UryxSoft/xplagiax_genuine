@@ -10,7 +10,7 @@ from flask import Blueprint, current_app, jsonify, request
 from pydantic import ValidationError
 
 from app.api.dependencies import AppDependencies
-from app.api.schemas import IndexRequestSchema, IndexResponseSchema
+from app.api.schemas import IndexRequestSchema, IndexResponseSchema, JobSubmittedSchema
 from app.application.indexing.indexing_pipeline import (
     EmptyDocumentError,
     IndexCommand,
@@ -44,6 +44,11 @@ def index_document():
             year=payload.anio,
         ),
     )
+
+    # worker_mode replicas hold a read-only index view: every write is a job
+    if payload.mode == "async" or deps.worker_mode:
+        job_id = deps.job_service.submit_index(command)
+        return jsonify(JobSubmittedSchema(job_id=job_id, status="PENDING").model_dump()), 202
 
     try:
         result = deps.indexing_pipeline.index(command)

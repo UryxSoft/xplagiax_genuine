@@ -8,6 +8,8 @@ as a gap, not silently implemented as a fire-and-forget stub.
 
 from __future__ import annotations
 
+from typing import Any, Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -15,6 +17,8 @@ class SearchRequestSchema(BaseModel):
     text: str = Field(min_length=1)
     tenant_id: str = Field(min_length=1)
     top_k_per_segment: int = Field(default=10, gt=0, le=100)
+    # mode=async returns {job_id} immediately (RF-13); poll GET /jobs/{id}
+    mode: Literal["sync", "async"] = "sync"
 
 
 class ChunkMatchSchema(BaseModel):
@@ -59,6 +63,7 @@ class IndexRequestSchema(BaseModel):
     institucion: str | None = None
     pais: str | None = None
     anio: int | None = None
+    mode: Literal["sync", "async"] = "sync"
 
 
 class IndexResponseSchema(BaseModel):
@@ -93,3 +98,18 @@ class StatsResponseSchema(BaseModel):
     chunks: int
     index_dimension: int
     index_version: int
+
+
+class JobSubmittedSchema(BaseModel):
+    job_id: str
+    status: str
+
+
+class JobStatusSchema(BaseModel):
+    job_id: str
+    kind: str
+    status: str
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    created_at: str
+    updated_at: str
