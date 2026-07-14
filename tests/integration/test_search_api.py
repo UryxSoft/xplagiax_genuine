@@ -12,6 +12,8 @@ import pytest
 
 from app.api.app_factory import create_app
 from app.api.dependencies import AppDependencies
+from app.application.indexing.document_deleter import DocumentDeleter
+from app.application.indexing.indexing_pipeline import IndexingPipeline
 from app.application.ranking.plagiarism_scorer import PlagiarismScorer
 from app.application.ranking.reranker import Reranker
 from app.application.search.candidate_filter import CandidateFilter
@@ -87,6 +89,22 @@ class _FakeVectorIndex:
         return self._hits.get(key, [])[:k]
 
 
+def _extra_dependencies(document_repository, chunk_repository, vector_index, chunker):
+    """The AppDependencies fields the search tests never invoke: the
+    constructors only store references, so the scripted fakes suffice."""
+    pipeline = IndexingPipeline(
+        chunker=chunker,
+        embedding_model=_FakeEmbeddingModel(),
+        language_detector=_FakeLanguageDetector(),
+        topic_classifier=_FakeTopicClassifier(),
+        vector_index=vector_index,
+        document_repository=document_repository,
+        chunk_repository=chunk_repository,
+    )
+    deleter = DocumentDeleter(document_repository, chunk_repository, vector_index)
+    return pipeline, deleter
+
+
 def _document() -> Document:
     return Document(
         id="doc-1",
@@ -112,8 +130,9 @@ def client():
     document_repository = _FakeDocumentRepository([document])
     chunk_repository = _FakeChunkRepository(chunk_map, chunks)
 
+    chunker = HybridChunker(WordTokenCounter(), min_tokens=3, max_tokens=20, overlap_ratio=0.0)
     pipeline = SearchPipeline(
-        chunker=HybridChunker(WordTokenCounter(), min_tokens=3, max_tokens=20, overlap_ratio=0.0),
+        chunker=chunker,
         embedding_model=_FakeEmbeddingModel(),
         language_detector=_FakeLanguageDetector(),
         topic_classifier=_FakeTopicClassifier(),
@@ -122,6 +141,9 @@ def client():
         result_aggregator=ResultAggregator(chunk_repository),
     )
 
+    indexing_pipeline, document_deleter = _extra_dependencies(
+        document_repository, chunk_repository, vector_index, chunker
+    )
     dependencies = AppDependencies(
         document_repository=document_repository,
         chunk_repository=chunk_repository,
@@ -130,6 +152,9 @@ def client():
         search_pipeline=pipeline,
         reranker=Reranker(chunk_repository),
         plagiarism_scorer=PlagiarismScorer(),
+        indexing_pipeline=indexing_pipeline,
+        document_deleter=document_deleter,
+        vector_index=vector_index,
     )
 
     app = create_app(dependencies)
@@ -204,22 +229,32 @@ def test_search_no_matches_returns_empty_documents(client) -> None:
 def test_unknown_route_returns_404_json() -> None:
     from app.api.app_factory import create_app as factory
 
+    document_repository = _FakeDocumentRepository([])
+    chunk_repository = _FakeChunkRepository({}, [])
+    vector_index = _FakeVectorIndex({})
+    chunker = HybridChunker(WordTokenCounter(), min_tokens=3, max_tokens=20, overlap_ratio=0.0)
+    indexing_pipeline, document_deleter = _extra_dependencies(
+        document_repository, chunk_repository, vector_index, chunker
+    )
     dependencies = AppDependencies(
-        document_repository=_FakeDocumentRepository([]),
-        chunk_repository=_FakeChunkRepository({}, []),
+        document_repository=document_repository,
+        chunk_repository=chunk_repository,
         language_detector=_FakeLanguageDetector(),
         topic_classifier=_FakeTopicClassifier(),
         search_pipeline=SearchPipeline(
-            chunker=HybridChunker(WordTokenCounter(), min_tokens=3, max_tokens=20, overlap_ratio=0.0),
+            chunker=chunker,
             embedding_model=_FakeEmbeddingModel(),
             language_detector=_FakeLanguageDetector(),
             topic_classifier=_FakeTopicClassifier(),
-            candidate_filter=CandidateFilter(_FakeDocumentRepository([]), _FakeChunkRepository({}, [])),
-            vector_index=_FakeVectorIndex({}),
-            result_aggregator=ResultAggregator(_FakeChunkRepository({}, [])),
+            candidate_filter=CandidateFilter(document_repository, chunk_repository),
+            vector_index=vector_index,
+            result_aggregator=ResultAggregator(chunk_repository),
         ),
-        reranker=Reranker(_FakeChunkRepository({}, [])),
+        reranker=Reranker(chunk_repository),
         plagiarism_scorer=PlagiarismScorer(),
+        indexing_pipeline=indexing_pipeline,
+        document_deleter=document_deleter,
+        vector_index=vector_index,
     )
     app = factory(dependencies)
     with app.test_client() as test_client:

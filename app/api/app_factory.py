@@ -12,7 +12,9 @@ from flask import Flask
 
 from app.api.dependencies import AppDependencies
 from app.api.error_handlers import register_error_handlers
+from app.api.routes.documents import documents_bp
 from app.api.routes.health import health_bp
+from app.api.routes.index import index_bp
 from app.api.routes.search import search_bp
 
 
@@ -22,6 +24,8 @@ def create_app(dependencies: AppDependencies) -> Flask:
 
     app.register_blueprint(health_bp)
     app.register_blueprint(search_bp)
+    app.register_blueprint(index_bp)
+    app.register_blueprint(documents_bp)
     register_error_handlers(app)
 
     return app

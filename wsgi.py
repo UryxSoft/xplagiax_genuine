@@ -20,6 +20,8 @@ from sqlalchemy.orm import sessionmaker
 
 from app.api.app_factory import create_app
 from app.api.dependencies import AppDependencies
+from app.application.indexing.document_deleter import DocumentDeleter
+from app.application.indexing.indexing_pipeline import IndexingPipeline
 from app.application.ranking.plagiarism_scorer import PlagiarismScorer
 from app.application.ranking.reranker import Reranker
 from app.application.search.candidate_filter import CandidateFilter
@@ -100,6 +102,17 @@ def build_dependencies(settings: AppSettings | None = None) -> AppDependencies:
     reranker = Reranker(chunk_repository, InstitutionNormalizer())
     plagiarism_scorer = PlagiarismScorer()
 
+    indexing_pipeline = IndexingPipeline(
+        chunker=chunker,
+        embedding_model=embedding_model,
+        language_detector=language_detector,
+        topic_classifier=topic_classifier,
+        vector_index=vector_index,
+        document_repository=document_repository,
+        chunk_repository=chunk_repository,
+    )
+    document_deleter = DocumentDeleter(document_repository, chunk_repository, vector_index)
+
     return AppDependencies(
         document_repository=document_repository,
         chunk_repository=chunk_repository,
@@ -108,6 +121,9 @@ def build_dependencies(settings: AppSettings | None = None) -> AppDependencies:
         search_pipeline=search_pipeline,
         reranker=reranker,
         plagiarism_scorer=plagiarism_scorer,
+        indexing_pipeline=indexing_pipeline,
+        document_deleter=document_deleter,
+        vector_index=vector_index,
     )
 
 

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.domain.entities.chunk import Chunk
 from app.infrastructure.metadata.mappers import chunk_to_orm, orm_to_chunk
-from app.infrastructure.metadata.orm import ChunkModel
+from app.infrastructure.metadata.orm import ChunkModel, DocumentModel
 
 
 class SqlAlchemyChunkRepository:
@@ -42,3 +42,16 @@ class SqlAlchemyChunkRepository:
             return []
         stmt = select(ChunkModel.id).where(ChunkModel.document_id.in_(document_ids))
         return list(self._session.execute(stmt).scalars().all())
+
+    def delete_by_document(self, document_id: str) -> None:
+        self._session.execute(delete(ChunkModel).where(ChunkModel.document_id == document_id))
+        self._session.commit()
+
+    def count_for_tenant(self, tenant_id: str) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(ChunkModel)
+            .join(DocumentModel, ChunkModel.document_id == DocumentModel.id)
+            .where(DocumentModel.tenant_id == tenant_id)
+        )
+        return int(self._session.execute(stmt).scalar_one())

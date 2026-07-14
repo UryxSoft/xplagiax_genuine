@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.domain.entities.document import Document
@@ -34,7 +34,13 @@ class SqlAlchemyDocumentRepository:
         return orm_to_document(model) if model is not None else None
 
     def list(
-        self, tenant_id: str, language: str | None = None, topic: str | None = None, page: int = 1
+        self,
+        tenant_id: str,
+        language: str | None = None,
+        topic: str | None = None,
+        institution: str | None = None,
+        country: str | None = None,
+        page: int = 1,
     ) -> list[Document]:
         if page < 1:
             raise ValueError("page must be >= 1")
@@ -44,10 +50,20 @@ class SqlAlchemyDocumentRepository:
             stmt = stmt.where(DocumentModel.language_code == language)
         if topic is not None:
             stmt = stmt.where(DocumentModel.topic_domain == topic)
+        if institution is not None:
+            stmt = stmt.where(func.lower(DocumentModel.bib_institution) == institution.lower())
+        if country is not None:
+            stmt = stmt.where(func.lower(DocumentModel.bib_country) == country.lower())
 
         stmt = stmt.order_by(DocumentModel.id).offset((page - 1) * _PAGE_SIZE).limit(_PAGE_SIZE)
         models = self._session.execute(stmt).scalars().all()
         return [orm_to_document(m) for m in models]
+
+    def count(self, tenant_id: str) -> int:
+        stmt = select(func.count()).select_from(DocumentModel).where(
+            DocumentModel.tenant_id == tenant_id
+        )
+        return int(self._session.execute(stmt).scalar_one())
 
     def ids_matching(
         self, tenant_id: str, language: str | None = None, topic: str | None = None

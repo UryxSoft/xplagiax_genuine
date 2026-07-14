@@ -39,3 +39,57 @@ class SearchResponseSchema(BaseModel):
     query_topic: str
     global_plagiarism_percent: float
     documents: list[DocumentMatchSchema]
+
+
+class IndexRequestSchema(BaseModel):
+    """POST /index payload: full plain text plus optional catalog metadata.
+
+    idioma/tema, when provided, override automatic detection/classification
+    (the caller knows better than a heuristic); omitted fields fall back to
+    langdetect / centroid classification inside the pipeline.
+    """
+
+    text: str = Field(min_length=1)
+    tenant_id: str = Field(min_length=1)
+    filename: str | None = None
+    idioma: str | None = Field(default=None, min_length=2, max_length=2)
+    tema: str | None = None
+    titulo: str | None = None
+    autores: list[str] = Field(default_factory=list)
+    institucion: str | None = None
+    pais: str | None = None
+    anio: int | None = None
+
+
+class IndexResponseSchema(BaseModel):
+    document_id: str
+    chunks_indexed: int
+    duplicate: bool
+    idioma: str
+    tema: str
+
+
+class DocumentSummarySchema(BaseModel):
+    id: str
+    documento: str
+    titulo: str | None
+    autores: list[str]
+    institucion: str | None
+    pais: str | None
+    idioma: str | None
+    tema: str | None
+    estado: str
+    indexado_en: str | None
+
+
+class DocumentListResponseSchema(BaseModel):
+    documents: list[DocumentSummarySchema]
+    page: int
+
+
+class StatsResponseSchema(BaseModel):
+    tenant_id: str
+    documents: int
+    chunks: int
+    index_dimension: int
+    index_version: int

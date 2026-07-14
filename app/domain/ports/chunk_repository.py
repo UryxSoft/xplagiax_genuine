@@ -24,3 +24,9 @@ class ChunkRepository(Protocol):
         N+1 fetch-full-Chunk-per-document pattern.
         """
         ...
+
+    def delete_by_document(self, document_id: str) -> None:
+        ...
+
+    def count_for_tenant(self, tenant_id: str) -> int:
+        ...

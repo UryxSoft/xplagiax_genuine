@@ -19,8 +19,22 @@ class DocumentRepository(Protocol):
         ...
 
     def list(
-        self, tenant_id: str, language: str | None = None, topic: str | None = None, page: int = 1
+        self,
+        tenant_id: str,
+        language: str | None = None,
+        topic: str | None = None,
+        institution: str | None = None,
+        country: str | None = None,
+        page: int = 1,
     ) -> list[Document]:
+        """Paginated listing with dynamic, freely combinable filters (RF-14).
+
+        institution and country match case-insensitively: catalog values come
+        from heterogeneous user-supplied metadata, not a controlled vocabulary.
+        """
+        ...
+
+    def count(self, tenant_id: str) -> int:
         ...
 
     def ids_matching(

@@ -17,6 +17,7 @@ class BibliographicMetadata(BaseModel):
     title: str | None = None
     authors: tuple[str, ...] = ()
     institution: str | None = None
+    country: str | None = None
     faculty: str | None = None
     career: str | None = None
     year: int | None = None

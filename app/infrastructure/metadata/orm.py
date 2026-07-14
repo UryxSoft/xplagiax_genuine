@@ -37,6 +37,7 @@ class DocumentModel(Base):
     bib_title: Mapped[str | None]
     bib_authors: Mapped[list] = mapped_column(JSON, default=list)
     bib_institution: Mapped[str | None]
+    bib_country: Mapped[str | None]
     bib_faculty: Mapped[str | None]
     bib_career: Mapped[str | None]
     bib_year: Mapped[int | None]

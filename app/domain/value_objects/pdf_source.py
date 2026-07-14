@@ -4,16 +4,21 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
 
-ALLOWED_MIME_TYPES = frozenset({"application/pdf"})
+ALLOWED_MIME_TYPES = frozenset({"application/pdf", "text/plain"})
 MAX_PDF_SIZE_BYTES = 200 * 1024 * 1024  # 200 MB
+
+PLAIN_TEXT_PATH = "inline://text"
 
 
 class PdfSource(BaseModel):
-    """Immutable descriptor of an ingested PDF file.
+    """Immutable descriptor of an ingested source (PDF file or inline plain text).
 
-    Invariant: mime must be application/pdf and size must not exceed
-    MAX_PDF_SIZE_BYTES (NFR-10, path traversal / MIME guard is enforced
-    by the caller before constructing this value object).
+    Plain-text ingestion (POST /index) has no backing file: path is the
+    PLAIN_TEXT_PATH sentinel and pages is 0.
+
+    Invariant: mime must be an ALLOWED_MIME_TYPES member and size must not
+    exceed MAX_PDF_SIZE_BYTES (NFR-10, path traversal / MIME guard is
+    enforced by the caller before constructing this value object).
     """
 
     model_config = {"frozen": True}
