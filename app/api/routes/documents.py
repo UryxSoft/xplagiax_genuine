@@ -95,6 +95,8 @@ def delete_document(document_id: str):
     deleted = deps.document_deleter.delete(document_id, tenant_id)
     if not deleted:
         return jsonify({"error": "not_found", "message": "document not found"}), 404
+
+    deps.search_cache.invalidate_tenant(tenant_id)
     return jsonify({"deleted": True, "document_id": document_id}), 200
 
 

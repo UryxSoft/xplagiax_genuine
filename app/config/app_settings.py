@@ -13,9 +13,19 @@ class AppSettings(BaseSettings):
 
     database_url: str = Field(default="postgresql+psycopg://xplagiax:xplagiax@localhost:5432/xplagiax")
 
+    # "sentence-transformers" loads embedding_model_name via torch;
+    # "onnx" loads an exported model from onnx_model_dir (see
+    # OnnxEmbeddingAdapter) -- the low-RAM/CPU production profile.
+    embedding_backend: str = Field(default="sentence-transformers", pattern="^(sentence-transformers|onnx)$")
     embedding_model_name: str = Field(default="intfloat/multilingual-e5-large")
     embedding_device: str = Field(default="cpu")
     embedding_batch_size: int = Field(default=32, gt=0)
+    onnx_model_dir: Path = Field(default=Path("/models/e5-small-onnx"))
+    onnx_model_filename: str = Field(default="model.onnx")
+
+    redis_url: str | None = Field(default=None)
+    search_cache_ttl_seconds: int = Field(default=300, gt=0)
+    search_cache_max_entries: int = Field(default=1000, gt=0)
 
     turbovec_index_path: Path = Field(default=Path("/data/turbovec/index.tvim"))
     turbovec_bit_width: int = Field(default=4)

@@ -50,6 +50,9 @@ def index_document():
     except EmptyDocumentError as exc:
         return jsonify({"error": "empty_document", "message": str(exc)}), 400
 
+    if not result.duplicate:
+        deps.search_cache.invalidate_tenant(payload.tenant_id)
+
     response = IndexResponseSchema(
         document_id=result.document_id,
         chunks_indexed=result.chunks_indexed,

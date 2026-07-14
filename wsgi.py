@@ -1,22 +1,21 @@
 """Gunicorn entrypoint: wires real adapters and exposes the Flask app.
 
 Not exercised by the test suite (needs a live PostgreSQL, a downloaded
-e5-large model, a TurboVec index file, and optionally a running GROBID
+embedding model, a TurboVec index file, and optionally a running GROBID
 service) -- tests build AppDependencies from fakes instead
 (tests/integration/test_search_api.py). This module is the actual
 production wiring.
 
-Simplification: repositories share one long-lived SQLAlchemy Session per
-worker process rather than a request-scoped session (Flask
-teardown_appcontext). Acceptable for a single gunicorn worker handling
-requests sequentially; a multi-threaded worker class would need proper
-per-request session scoping before this is production-hardened.
+Sessions are request-scoped: repositories hold a scoped_session proxy and
+Flask's teardown_appcontext calls remove() after every request, so a
+multi-threaded or multi-request worker never leaks one request's identity
+map or failed transaction into the next.
 """
 
 from __future__ import annotations
 
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import scoped_session, sessionmaker
 
 from app.api.app_factory import create_app
 from app.api.dependencies import AppDependencies
@@ -52,21 +51,53 @@ _TOPIC_SEED_TEXTS = {
 }
 
 
-def build_dependencies(settings: AppSettings | None = None) -> AppDependencies:
-    settings = settings or AppSettings()
+def _build_embedding_model(settings: AppSettings):
+    if settings.embedding_backend == "onnx":
+        from app.infrastructure.embeddings.onnx_embedding_adapter import OnnxEmbeddingAdapter
 
-    engine = create_engine(settings.database_url)
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
-
-    document_repository = SqlAlchemyDocumentRepository(session)
-    chunk_repository = SqlAlchemyChunkRepository(session)
-
-    embedding_model = E5LargeAdapter(
+        return OnnxEmbeddingAdapter(
+            model_dir=settings.onnx_model_dir,
+            model_filename=settings.onnx_model_filename,
+            batch_size=settings.embedding_batch_size,
+        )
+    return E5LargeAdapter(
         model_name=settings.embedding_model_name,
         device=settings.embedding_device,
         batch_size=settings.embedding_batch_size,
     )
+
+
+def _build_search_cache(settings: AppSettings):
+    if settings.redis_url:
+        import redis
+
+        from app.infrastructure.cache.redis_search_cache import RedisSearchCache
+
+        return RedisSearchCache(
+            redis.Redis.from_url(settings.redis_url),
+            ttl_seconds=settings.search_cache_ttl_seconds,
+        )
+    from app.infrastructure.cache.in_memory_search_cache import InMemorySearchCache
+
+    return InMemorySearchCache(
+        max_entries=settings.search_cache_max_entries,
+        ttl_seconds=float(settings.search_cache_ttl_seconds),
+    )
+
+
+def build_dependencies(
+    settings: AppSettings | None = None,
+) -> tuple[AppDependencies, scoped_session]:
+    settings = settings or AppSettings()
+
+    engine = create_engine(settings.database_url)
+    Base.metadata.create_all(engine)
+    session = scoped_session(sessionmaker(bind=engine))
+
+    document_repository = SqlAlchemyDocumentRepository(session)
+    chunk_repository = SqlAlchemyChunkRepository(session)
+
+    embedding_model = _build_embedding_model(settings)
 
     vector_index = TurboVecRepository(
         dimension=embedding_model.dimension,
@@ -113,7 +144,7 @@ def build_dependencies(settings: AppSettings | None = None) -> AppDependencies:
     )
     document_deleter = DocumentDeleter(document_repository, chunk_repository, vector_index)
 
-    return AppDependencies(
+    dependencies = AppDependencies(
         document_repository=document_repository,
         chunk_repository=chunk_repository,
         language_detector=language_detector,
@@ -124,7 +155,15 @@ def build_dependencies(settings: AppSettings | None = None) -> AppDependencies:
         indexing_pipeline=indexing_pipeline,
         document_deleter=document_deleter,
         vector_index=vector_index,
+        search_cache=_build_search_cache(settings),
     )
+    return dependencies, session
 
 
-app = create_app(build_dependencies())
+_dependencies, _session_scope = build_dependencies()
+app = create_app(_dependencies)
+
+
+@app.teardown_appcontext
+def _remove_request_session(_exc: BaseException | None) -> None:
+    _session_scope.remove()
