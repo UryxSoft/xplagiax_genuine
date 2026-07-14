@@ -1,0 +1,89 @@
+# Multi-node topology (Fase 3/4, ADR-010 single-writer): N stateless web
+# replicas behind nginx, ONE indexer worker owning the index, Redis for
+# jobs + shared L2 cache, PostgreSQL for metadata.
+#
+#   docker compose -f docker-compose.multinode.yml up -d --scale app=3
+#
+# Read scaling = more app replicas (the index directory is mounted
+# read-only in them; the manifest hot-reload picks up new versions).
+# Write scaling stays at exactly one worker: do NOT scale the worker
+# service without partitioning the index first (docs/SCALING.md).
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8000:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  app:
+    build: .
+    # no host port: nginx is the single entrypoint, replicas stay scalable
+    environment:
+      DATABASE_URL: postgresql+psycopg://xplagiax:xplagiax@postgres:5432/xplagiax
+      REDIS_URL: redis://redis:6379/0
+      INDEX_WRITE_MODE: worker
+      INDEX_DATA_DIR: /data/turbovec
+      WEB_CONCURRENCY: 2
+    volumes:
+      - turbovec_data:/data/turbovec:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.workers.indexer_worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://xplagiax:xplagiax@postgres:5432/xplagiax
+      REDIS_URL: redis://redis:6379/0
+      INDEX_DATA_DIR: /data/turbovec
+      INDEX_CHECKPOINT_EVERY_OPS: 50
+      JOBS_CONSUMER_NAME: worker-1
+    volumes:
+      - turbovec_data:/data/turbovec
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: xplagiax
+      POSTGRES_USER: xplagiax
+      POSTGRES_PASSWORD: xplagiax
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xplagiax"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  turbovec_data:

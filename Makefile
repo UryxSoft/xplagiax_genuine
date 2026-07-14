@@ -22,6 +22,15 @@ docker-up:
 docker-up-full:
 	docker compose --profile with-grobid up -d
 
+# Multi-node topology (docs/SCALING.md): nginx + N web replicas +
+# single indexer worker + redis. Scale reads with REPLICAS=n.
+REPLICAS ?= 2
+docker-up-multinode:
+	docker compose -f docker-compose.multinode.yml up -d --scale app=$(REPLICAS)
+
+docker-down-multinode:
+	docker compose -f docker-compose.multinode.yml down
+
 docker-down:
 	docker compose down
 
